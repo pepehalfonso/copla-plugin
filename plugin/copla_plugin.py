@@ -10,19 +10,22 @@ import os
 import secrets
 
 from qgis.core import Qgis, QgsApplication
-from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtCore import Qt, QTimer, QUrl
+from qgis.PyQt.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from qgis.PyQt.QtWidgets import (
     QAction,
     QCheckBox,
     QComboBox,
     QDockWidget,
+    QGroupBox,
+    QHBoxLayout,
     QLabel,
     QPlainTextEdit,
     QPushButton,
     QVBoxLayout,
     QWidget,
 )
-from qgis.PyQt.QtGui import QGuiApplication, QIcon
+from qgis.PyQt.QtGui import QFontDatabase, QGuiApplication, QIcon
 
 from .discovery import TOKEN_NAME, remove_config, write_config
 from .http_server import CoplaHttpServer
@@ -131,6 +134,8 @@ class CoplaPlugin:
         self.server = None
         self.dock = None
         self.action = None
+        self._qnam = None
+        self._tabify_attempted = False
 
     # ------------------------------------------------------------- lifecycle
 
@@ -168,6 +173,8 @@ class CoplaPlugin:
         if self.server is not None and self.server.is_listening():
             return True
         self.token = _load_token()
+        if self.dock is not None:
+            self.test_result.setText("")
         server = CoplaHttpServer(
             self.port,
             self.token,
@@ -205,6 +212,8 @@ class CoplaPlugin:
         if self.server is not None:
             self.server.stop()
             self.server = None
+        if self.dock is not None:
+            self.test_result.setText("")
         try:
             remove_config(_profile_dir())
         except OSError:
@@ -235,48 +244,88 @@ class CoplaPlugin:
         dock.setObjectName("CoplaDock")
         widget = QWidget()
         layout = QVBoxLayout(widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+        try:
+            mono = QFontDatabase.systemFont(QFontDatabase.FixedFont)
+        except AttributeError:
+            mono = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
 
+        group_state = QGroupBox("Estado")
+        state_l = QVBoxLayout(group_state)
+        state_l.setSpacing(6)
         self.status_label = QLabel()
-        layout.addWidget(self.status_label)
+        self.info_label = QLabel(
+            "Copla v%s · QGIS %s · %d herramientas"
+            % (PLUGIN_VERSION, Qgis.QGIS_VERSION, len(tools_manifest()))
+        )
+        self.info_label.setStyleSheet("color:#5f6368; font-size:11px;")
+        row_state = QHBoxLayout()
+        self.toggle_btn = QPushButton("Detener")
+        self.toggle_btn.clicked.connect(self._toggle_from_dock)
+        self.test_btn = QPushButton("Probar conexión")
+        self.test_btn.clicked.connect(self._self_test)
+        row_state.addWidget(self.toggle_btn)
+        row_state.addWidget(self.test_btn)
+        self.test_result = QLabel("")
+        self.test_result.setWordWrap(True)
+        self.test_result.setStyleSheet("font-size:11px;")
+        state_l.addWidget(self.status_label)
+        state_l.addWidget(self.info_label)
+        state_l.addLayout(row_state)
+        state_l.addWidget(self.test_result)
+        layout.addWidget(group_state)
 
+        group_token = QGroupBox("Token")
+        token_l = QVBoxLayout(group_token)
+        token_l.setSpacing(6)
         self.token_label = QLabel()
         self.token_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        layout.addWidget(self.token_label)
-
-        self.show_token = QCheckBox("Mostrar token")
+        self.token_label.setFont(mono)
+        row_token = QHBoxLayout()
+        self.show_token = QCheckBox("Mostrar")
         self.show_token.toggled.connect(lambda _: self._refresh_status())
-        layout.addWidget(self.show_token)
+        copy_token = QPushButton("Copiar token")
+        copy_token.clicked.connect(self._copy_token)
+        row_token.addWidget(self.show_token)
+        row_token.addWidget(copy_token)
+        row_token.addStretch(1)
+        token_l.addWidget(self.token_label)
+        token_l.addLayout(row_token)
+        layout.addWidget(group_token)
 
-        layout.addWidget(QLabel("Cliente IA:"))
+        group_client = QGroupBox("Conectar cliente IA")
+        client_l = QVBoxLayout(group_client)
+        client_l.setSpacing(6)
+        client_l.addWidget(QLabel("Cliente:"))
         self.client_combo = QComboBox()
         for key, entry in SNIPPETS.items():
             self.client_combo.addItem(entry["label"], key)
         self.client_combo.currentIndexChanged.connect(lambda _: self._refresh_snippet())
-        layout.addWidget(self.client_combo)
-
+        client_l.addWidget(self.client_combo)
         self.snippet_hint = QLabel()
         self.snippet_hint.setWordWrap(True)
-        layout.addWidget(self.snippet_hint)
-
+        self.snippet_hint.setStyleSheet("color:#5f6368; font-size:11px;")
+        client_l.addWidget(self.snippet_hint)
         self.snippet_edit = QPlainTextEdit()
         self.snippet_edit.setReadOnly(True)
-        self.snippet_edit.setMinimumHeight(140)
-        layout.addWidget(self.snippet_edit)
-
+        self.snippet_edit.setFont(mono)
+        self.snippet_edit.setMinimumHeight(110)
+        client_l.addWidget(self.snippet_edit)
         copy_button = QPushButton("Copiar configuración")
         copy_button.clicked.connect(self._copy_snippet)
-        layout.addWidget(copy_button)
+        client_l.addWidget(copy_button)
+        layout.addWidget(group_client)
 
         note = QLabel(
-            "Lado MCP: requiere uv (docs.astral.sh/uv).\n"
-            "Los snippets ya usan la forma Git, listos para pegar.\n"
-            "El servidor MCP detecta QGIS solo."
+            "Requisitos del lado IA: uv (docs.astral.sh/uv).\n"
+            "Los snippets usan la forma Git: listos para pegar.\n"
+            "El servidor MCP detecta QGIS automáticamente."
         )
         note.setWordWrap(True)
-        note.setStyleSheet("color: #666; font-size: 11px;")
+        note.setStyleSheet("color:#666; font-size:11px;")
         layout.addWidget(note)
 
-        widget.setLayout(layout)
         dock.setWidget(widget)
         try:
             area = Qt.RightDockWidgetArea
@@ -284,8 +333,44 @@ class CoplaPlugin:
             area = Qt.DockWidgetArea.RightDockWidgetArea
         self.iface.addDockWidget(area, dock)
         self.dock = dock
+        self._tabify_retries = 0
+        self._try_tabify()
+        QTimer.singleShot(3000, self._tabify_recheck)
         self._refresh_snippet()
         self._refresh_status()
+
+    def _tabify_recheck(self):
+        if self.dock is None or self._tabify_attempted:
+            return
+        self._tabify_retries += 1
+        self._try_tabify()
+        if not self._tabify_attempted and self._tabify_retries < 20:
+            QTimer.singleShot(3000, self._tabify_recheck)
+
+    def _try_tabify(self):
+        if self.dock is None:
+            return
+        window = self.iface.mainWindow()
+        if window.tabifiedDockWidgets(self.dock):
+            self.dock.raise_()
+            self._tabify_attempted = True
+            return
+        if self._tabify_attempted:
+            return
+        try:
+            area = Qt.RightDockWidgetArea
+        except AttributeError:
+            area = Qt.DockWidgetArea.RightDockWidgetArea
+        for other in window.findChildren(QDockWidget):
+            if (
+                other is not self.dock
+                and other.isVisible()
+                and window.dockWidgetArea(other) == area
+            ):
+                window.tabifyDockWidget(other, self.dock)
+                self.dock.raise_()
+                self._tabify_attempted = True
+                return
 
     def _refresh_status(self):
         if self.dock is None:
@@ -293,15 +378,80 @@ class CoplaPlugin:
         running = self.server is not None and self.server.is_listening()
         if running:
             self.status_label.setText(
-                "<b style='color:#1a7f37'>● Activo</b> en 127.0.0.1:%d" % self.port
+                "<b style='color:#1a7f37'>● Activo</b> — 127.0.0.1:%d" % self.port
             )
+            self.toggle_btn.setText("Detener")
+            self.test_btn.setEnabled(True)
         else:
             self.status_label.setText("<b style='color:#b42318'>● Detenido</b>")
+            self.toggle_btn.setText("Iniciar")
+            self.test_btn.setEnabled(False)
+        token = self.token or "-"
         if self.show_token.isChecked():
-            self.token_label.setText("Token: %s" % (self.token or "-"))
+            self.token_label.setText(token)
         else:
-            token = self.token or "-"
-            self.token_label.setText("Token: %s..." % token[:8])
+            self.token_label.setText("%s..." % token[:8])
+
+    def _toggle_from_dock(self):
+        running = self.server is not None and self.server.is_listening()
+        if running:
+            self.stop()
+        else:
+            self.start()
+
+    def _copy_token(self):
+        QGuiApplication.clipboard().setText(self.token or "")
+        self._bar("Token copiado al portapapeles")
+
+    def _self_test(self):
+        if self.server is None or not self.server.is_listening():
+            return
+        self.test_btn.setEnabled(False)
+        self.test_result.setStyleSheet("font-size:11px; color:#5f6368;")
+        self.test_result.setText("Probando…")
+        request = QNetworkRequest(
+            QUrl("http://127.0.0.1:%d/v1/tools" % self.port)
+        )
+        request.setRawHeader(b"X-Copla-Token", (self.token or "").encode("ascii"))
+        try:
+            request.setTransferTimeout(4000)
+        except AttributeError:
+            pass
+        if self._qnam is None:
+            self._qnam = QNetworkAccessManager(self.dock)
+        reply = self._qnam.get(request)
+        reply.finished.connect(lambda: self._self_test_done(reply))
+
+    def _self_test_done(self, reply):
+        try:
+            if self.dock is None:
+                return
+            status = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
+            try:
+                no_error = QNetworkReply.NetworkError.NoError
+            except AttributeError:
+                no_error = QNetworkReply.NoError
+            if reply.error() == no_error:
+                tools = []
+                try:
+                    data = json.loads(bytes(reply.readAll().data()).decode("utf-8"))
+                    tools = data.get("tools") or []
+                except (ValueError, UnicodeDecodeError, AttributeError):
+                    pass
+                self.test_result.setStyleSheet("font-size:11px; color:#1a7f37;")
+                self.test_result.setText(
+                    "✓ Responde correctamente — %d herramientas" % len(tools)
+                )
+            elif status == 401:
+                self.test_result.setStyleSheet("font-size:11px; color:#b42318;")
+                self.test_result.setText("✗ Token rechazado (401)")
+            else:
+                self.test_result.setStyleSheet("font-size:11px; color:#b42318;")
+                self.test_result.setText("✗ Sin respuesta: %s" % reply.errorString())
+        finally:
+            reply.deleteLater()
+            if self.dock is not None:
+                self.test_btn.setEnabled(True)
 
     def _refresh_snippet(self):
         if self.dock is None:
