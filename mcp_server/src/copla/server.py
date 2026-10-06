@@ -108,6 +108,53 @@ def add_layer(path: str, name: str | None = None, group: str | None = None) -> d
 
 
 @mcp.tool()
+def create_layer(
+    name: str,
+    geometry_type: str,
+    fields: list[dict],
+    crs: str | None = None,
+    path: str | None = None,
+    group: str | None = None,
+) -> dict:
+    """Create a new empty vector layer file (gpkg or shp) with an attribute schema, ready for add_features. fields=[{"name": "id", "type": "string"|"integer"|"real"}]."""
+    args: dict[str, Any] = {
+        "name": name,
+        "geometry_type": geometry_type,
+        "fields": fields,
+    }
+    if crs:
+        args["crs"] = crs
+    if path:
+        args["path"] = path
+    if group:
+        args["group"] = group
+    return _call("create_layer", args)
+
+
+@mcp.tool()
+def download_layer(url: str, name: str | None = None, group: str | None = None) -> dict:
+    """Download a geodata file (geojson, gpkg, kml, csv, zip, tif...) from an http(s) URL into the local cache and add it as a layer. Max 100 MB."""
+    args: dict[str, Any] = {"url": url}
+    if name:
+        args["name"] = name
+    if group:
+        args["group"] = group
+    return _call("download_layer", args)
+
+
+@mcp.tool()
+def http_get(url: str) -> dict:
+    """Fetch an http(s) URL and return its body as text (max 200 KB). For APIs, CSV and JSON endpoints."""
+    return _call("http_get", {"url": url})
+
+
+@mcp.tool()
+def save_layer_as(layer: str, path: str) -> dict:
+    """Export a layer to a file: vector to .gpkg/.geojson/.shp/.kml, raster to .tif/.img/.png."""
+    return _call("save_layer_as", {"layer": layer, "path": path})
+
+
+@mcp.tool()
 def remove_layer(layer: str) -> dict:
     """Remove a layer from the project (the file on disk is kept)."""
     return _call("remove_layer", {"layer": layer})
@@ -270,6 +317,20 @@ def set_labels(
     if expression:
         args["expression"] = expression
     return _call("set_labels", args)
+
+
+# ------------------------------------------------------------------ files
+
+@mcp.tool()
+def list_directory(path: str) -> dict:
+    """List files and folders inside a directory (name, kind, size). Max 500 entries."""
+    return _call("list_directory", {"path": path})
+
+
+@mcp.tool()
+def move_file(src: str, dst: str) -> dict:
+    """Move or rename a file or folder on disk; creates destination folders, destination must not exist."""
+    return _call("move_file", {"src": src, "dst": dst})
 
 
 # ------------------------------------------------------------------ view & selection

@@ -6,7 +6,9 @@ only call operations that were written and reviewed by maintainers.
 """
 
 import os
+import shutil
 import sys
+import urllib.parse
 
 from qgis.core import (
     Qgis,
@@ -18,10 +20,13 @@ from qgis.core import (
     QgsExpressionContext,
     QgsFeature,
     QgsFeatureRequest,
+    QgsField,
+    QgsFields,
     QgsGeometry,
     QgsGraduatedSymbolRenderer,
     QgsLayoutExporter,
     QgsMapRendererSequentialJob,
+    QgsNetworkAccessManager,
     QgsPalLayerSettings,
     QgsProcessingFeedback,
     QgsProcessingParameterDefinition,
@@ -35,12 +40,14 @@ from qgis.core import (
     QgsSymbol,
     QgsTextBufferSettings,
     QgsTextFormat,
+    QgsVectorFileWriter,
     QgsVectorLayer,
     QgsVectorLayerSimpleLabeling,
     QgsWkbTypes,
 )
-from qgis.PyQt.QtCore import QSize
+from qgis.PyQt.QtCore import QEventLoop, QSize, QTimer, QUrl, QVariant
 from qgis.PyQt.QtGui import QColor
+from qgis.PyQt.QtNetwork import QNetworkReply, QNetworkRequest
 from qgis.utils import iface
 
 try:
@@ -396,19 +403,15 @@ def get_layer_info(layer):
     return info
 
 
-@tool("add_layer", "Add a vector or raster file as a layer. Vector via OGR (shp, geojson, gpkg, ...) and raster via GDAL (tif, img, ...). Provider is chosen from the file.", params={
-    "path": {"type": "string", "required": True, "description": "Absolute path to the data file (or OGR/GDAL connection string)"},
-    "name": {"type": "string", "required": False, "description": "Layer name; defaults to the file name"},
-    "group": {"type": "string", "required": False, "description": "Place the layer inside this layer-tree group (created if missing)"},
-}, mutates=True)
-def add_layer(path, name=None, group=None):
-    if not os.path.exists(path) and "://" not in path:
-        raise ToolError("File not found: %s" % path, code="not_found")
-    base = name or os.path.splitext(os.path.basename(path))[0]
-    vector = QgsVectorLayer(path, base, "ogr")
+def _load_layer_from_path(path, name=None, group=None):
+    base = name or os.path.splitext(os.path.basename(path.rstrip("/")))[0]
+    load_path = path
+    if path.lower().endswith(".zip") and not path.lower().startswith("/vsizip/"):
+        load_path = "/vsizip/" + path.replace("\\", "/")
+    vector = QgsVectorLayer(load_path, base, "ogr")
     if not vector.isValid():
         vector = None
-        raster = QgsRasterLayer(path, base)
+        raster = QgsRasterLayer(load_path, base)
         if not raster.isValid():
             raise ToolError(
                 "Could not load '%s' as vector (OGR) or raster (GDAL)." % path,
@@ -423,10 +426,254 @@ def add_layer(path, name=None, group=None):
         node = root.findGroup(group)
         if node is None:
             node = root.addGroup(group)
+        project.addMapLayer(layer, False)
         node.addLayer(layer)
     else:
         project.addMapLayer(layer)
     return layer_summary(layer)
+
+
+@tool("add_layer", "Add a vector or raster file as a layer. Vector via OGR (shp, geojson, gpkg, ...) and raster via GDAL (tif, img, ...). Provider is chosen from the file.", params={
+    "path": {"type": "string", "required": True, "description": "Absolute path to the data file (or OGR/GDAL connection string)"},
+    "name": {"type": "string", "required": False, "description": "Layer name; defaults to the file name"},
+    "group": {"type": "string", "required": False, "description": "Place the layer inside this layer-tree group (created if missing)"},
+}, mutates=True)
+def add_layer(path, name=None, group=None):
+    if not os.path.exists(path) and "://" not in path:
+        raise ToolError("File not found: %s" % path, code="not_found")
+    return _load_layer_from_path(path, name, group)
+
+
+@tool("create_layer", "Create a new empty vector layer file (gpkg or shp) with an attribute schema, and add it to the project. Ready for add_features. Note: GeoJSON cannot store fields without features, so it is not accepted here.", params={
+    "name": {"type": "string", "required": True, "description": "Layer name (also the default file name)"},
+    "geometry_type": {"type": "string", "required": True, "enum": ["point", "line", "polygon", "multipoint", "multiline", "multipolygon", "table"], "description": "Geometry type; 'table' creates an attribute-only layer"},
+    "fields": {"type": "array", "required": True, "description": "Attribute schema: [{\"name\": \"id\", \"type\": \"string\"|\"integer\"|\"real\"}, ...] (may be empty)"},
+    "crs": {"type": "string", "required": False, "description": "CRS authid (default EPSG:4326)"},
+    "path": {"type": "string", "required": False, "description": "Target file (.gpkg or .shp); defaults to copla_layers/<name>.gpkg in the QGIS profile"},
+    "group": {"type": "string", "required": False, "description": "Layer-tree group (created if missing)"},
+}, mutates=True)
+def create_layer(name, geometry_type, fields, crs=None, path=None, group=None):
+    wkb = {
+        "point": QgsWkbTypes.Point,
+        "line": QgsWkbTypes.LineString,
+        "polygon": QgsWkbTypes.Polygon,
+        "multipoint": QgsWkbTypes.MultiPoint,
+        "multiline": QgsWkbTypes.MultiLineString,
+        "multipolygon": QgsWkbTypes.MultiPolygon,
+        "table": QgsWkbTypes.NoGeometry,
+    }[geometry_type]
+    target_srs = QgsCoordinateReferenceSystem(crs or "EPSG:4326")
+    if not target_srs.isValid():
+        raise ToolError("Invalid CRS: %s" % crs, code="bad_args")
+    qfields = QgsFields()
+    seen = set()
+    for spec in fields:
+        if not isinstance(spec, dict) or "name" not in spec:
+            raise ToolError("Each field must be an object with 'name' and 'type'", code="bad_args")
+        ftype = spec.get("type", "string")
+        if ftype not in ("string", "integer", "real"):
+            raise ToolError("Field type must be string, integer or real (got %s)" % ftype, code="bad_args")
+        fname = str(spec["name"])
+        if fname in seen:
+            raise ToolError("Duplicate field name '%s'" % fname, code="bad_args")
+        seen.add(fname)
+        vtype = {"string": QVariant.String, "integer": QVariant.Int, "real": QVariant.Double}[ftype]
+        qfields.append(QgsField(fname, vtype))
+    if path is None:
+        safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in name).strip("_") or "layer"
+        path = os.path.join(QgsApplication.qgisSettingsDirPath(), "copla_layers", safe + ".gpkg")
+    path = os.path.abspath(path)
+    ext = os.path.splitext(path)[1].lower()
+    driver = {".gpkg": "GPKG", ".shp": "ESRI Shapefile"}.get(ext)
+    if driver is None:
+        raise ToolError(
+            "path must end in .gpkg or .shp (GeoJSON cannot keep a field schema without features)",
+            code="bad_args",
+        )
+    if os.path.exists(path):
+        raise ToolError("File already exists: %s" % path, code="io_error")
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    uri = {
+        "point": "Point",
+        "line": "LineString",
+        "polygon": "Polygon",
+        "multipoint": "MultiPoint",
+        "multiline": "MultiLineString",
+        "multipolygon": "MultiPolygon",
+        "table": "None",
+    }[geometry_type]
+    mem = QgsVectorLayer("%s?crs=%s" % (uri, target_srs.authid()), name, "memory")
+    mem.dataProvider().addAttributes([QgsField(f) for f in qfields])
+    mem.updateFields()
+    try:
+        err = QgsVectorFileWriter.writeAsVectorFormat(mem, path, "UTF-8", target_srs, driver)
+    except Exception as exc:
+        raise ToolError("Could not create '%s': %s" % (path, exc), code="io_error")
+    if isinstance(err, tuple):
+        err = err[0]
+    if err != QgsVectorFileWriter.NoError or not os.path.exists(path):
+        raise ToolError("Could not create '%s' (writer error %s)" % (path, err), code="io_error")
+    return _load_layer_from_path(path, name, group)
+
+
+_CONTENT_TYPE_EXT = {
+    "application/geo+json": ".geojson",
+    "application/json": ".geojson",
+    "application/geopackage+sqlite3": ".gpkg",
+    "application/zip": ".zip",
+    "application/x-zip-compressed": ".zip",
+    "image/tiff": ".tif",
+    "image/geotiff": ".tif",
+    "application/vnd.google-earth.kml+xml": ".kml",
+    "application/vnd.google-earth.kmz": ".kmz",
+    "text/csv": ".csv",
+    "application/gml+xml": ".gml",
+}
+
+
+def _http_get_bytes(url, max_bytes, timeout_ms=60000):
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ToolError("Only http:// and https:// URLs are supported", code="bad_args")
+    request = QNetworkRequest(QUrl(url))
+    request.setRawHeader(b"User-Agent", b"Copla-QGIS-Plugin")
+    reply = QgsNetworkAccessManager.instance().get(request)
+    loop = QEventLoop()
+    state = {"timeout": False, "overflow": False}
+    timer = QTimer()
+    timer.setSingleShot(True)
+
+    def on_timeout():
+        state["timeout"] = True
+        reply.abort()
+        loop.quit()
+
+    def on_progress(received, total):
+        if received > max_bytes or (total and total > max_bytes):
+            state["overflow"] = True
+            reply.abort()
+            loop.quit()
+
+    timer.timeout.connect(on_timeout)
+    reply.downloadProgress.connect(on_progress)
+    reply.finished.connect(loop.quit)
+    timer.start(timeout_ms)
+    loop.exec_()
+    timer.stop()
+    for sig, fn in ((reply.downloadProgress, on_progress), (reply.finished, loop.quit), (timer.timeout, on_timeout)):
+        try:
+            sig.disconnect(fn)
+        except (TypeError, RuntimeError):
+            pass
+    status = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
+    content_type = reply.header(QNetworkRequest.ContentTypeHeader)
+    if state["timeout"]:
+        reply.deleteLater()
+        raise ToolError("Timed out fetching %s" % url, code="io_error")
+    if state["overflow"]:
+        reply.deleteLater()
+        raise ToolError(
+            "Response larger than the %d MB limit" % (max_bytes // (1024 * 1024)),
+            code="io_error",
+        )
+    if reply.error() != QNetworkReply.NoError:
+        message = reply.errorString()
+        reply.deleteLater()
+        raise ToolError("HTTP error for %s: %s (status %s)" % (url, message, status), code="io_error")
+    data = bytes(reply.readAll())
+    reply.deleteLater()
+    if status is not None and not (200 <= int(status) < 300):
+        raise ToolError("HTTP status %s for %s" % (status, url), code="io_error")
+    return data, str(content_type or "")
+
+
+@tool("download_layer", "Download a geodata file from an http(s) URL into the local Copla cache and add it as a layer. Works with geojson, gpkg, kml, csv, zip (shapefile bundle), tif, ... Max 100 MB.", params={
+    "url": {"type": "string", "required": True, "description": "Direct http(s) URL of the data file"},
+    "name": {"type": "string", "required": False, "description": "Layer name; defaults to the file name"},
+    "group": {"type": "string", "required": False, "description": "Layer-tree group (created if missing)"},
+}, mutates=True)
+def download_layer(url, name=None, group=None):
+    data, content_type = _http_get_bytes(url, max_bytes=100 * 1024 * 1024, timeout_ms=120000)
+    if not data:
+        raise ToolError("The URL returned an empty body", code="io_error")
+    basename = os.path.basename(urllib.parse.urlparse(url).path.rstrip("/")) or "download"
+    base, ext = os.path.splitext(basename)
+    ext = ext.lower()
+    known = {".geojson", ".json", ".gpkg", ".shp", ".kml", ".kmz", ".gml", ".csv", ".zip", ".tif", ".tiff", ".img", ".asc"}
+    if ext not in known:
+        ctype = content_type.split(";")[0].strip().lower()
+        ext = _CONTENT_TYPE_EXT.get(ctype)
+        if ext is None:
+            raise ToolError(
+                "Cannot determine file type from url or Content-Type '%s'; use add_layer with a local path instead" % content_type,
+                code="io_error",
+            )
+        basename = basename + ext if not os.path.splitext(basename)[1] else base + ext
+    cache_dir = os.path.join(QgsApplication.qgisSettingsDirPath(), "copla_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    target = os.path.join(cache_dir, os.path.basename(basename))
+    try:
+        with open(target, "wb") as fh:
+            fh.write(data)
+    except OSError as exc:
+        raise ToolError("Could not write %s: %s" % (target, exc), code="io_error")
+    summary = _load_layer_from_path(target, name, group)
+    summary["source_url"] = url
+    summary["file"] = target
+    return summary
+
+
+@tool("http_get", "Fetch a http(s) URL and return its body as text. Useful for APIs, CSV and JSON endpoints (max 200 KB).", params={
+    "url": {"type": "string", "required": True, "description": "http(s) URL to fetch"},
+})
+def http_get(url):
+    data, content_type = _http_get_bytes(url, max_bytes=200 * 1024, timeout_ms=30000)
+    return {
+        "url": url,
+        "content_type": content_type,
+        "bytes": len(data),
+        "truncated": len(data) >= 200 * 1024,
+        "body": data.decode("utf-8", "replace"),
+    }
+
+
+@tool("save_layer_as", "Export a layer to a file. Vector: .gpkg, .geojson, .shp or .kml; raster: .tif/.img/.png (via gdal:translate).", params={
+    "layer": {"type": "string", "required": True, "description": "Layer id or name"},
+    "path": {"type": "string", "required": True, "description": "Absolute destination path with extension"},
+}, mutates=True)
+def save_layer_as(layer, path):
+    lyr = find_layer(layer)
+    ext = os.path.splitext(path)[1].lower()
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    if isinstance(lyr, QgsVectorLayer):
+        drivers = {".gpkg": "GPKG", ".geojson": "GeoJSON", ".json": "GeoJSON", ".shp": "ESRI Shapefile", ".kml": "KML"}
+        driver = drivers.get(ext)
+        if driver is None:
+            raise ToolError("For vector layers path must end in: %s" % ", ".join(drivers), code="bad_args")
+        try:
+            err = QgsVectorFileWriter.writeAsVectorFormat(lyr, path, "UTF-8", lyr.crs(), driver)
+        except Exception as exc:
+            raise ToolError("Export failed: %s" % exc, code="io_error")
+        if isinstance(err, tuple):
+            err = err[0]
+        if err != QgsVectorFileWriter.NoError:
+            raise ToolError("Export failed with code %s" % err, code="io_error")
+    else:
+        if ext not in (".tif", ".tiff", ".img", ".png", ".jpg", ".jpeg"):
+            raise ToolError("For raster layers path must end in .tif, .img, .png or .jpg", code="bad_args")
+        if processing is None:
+            raise ToolError("Processing plugin is not available for raster export", code="tool_error")
+        try:
+            processing.run("gdal:translate", {"INPUT": lyr, "OUTPUT": path})
+        except Exception as exc:
+            raise ToolError("Raster export failed: %s" % exc, code="run_error")
+    if not os.path.exists(path):
+        raise ToolError("Export reported success but %s does not exist" % path, code="io_error")
+    return {"saved": path, "size": os.path.getsize(path)}
 
 
 @tool("remove_layer", "Remove a layer from the project (does not delete the file on disk).", params={
@@ -952,6 +1199,55 @@ def zoom_to_selection(layer):
     iface.mapCanvas().zoomToSelected(lyr)
     iface.mapCanvas().refresh()
     return {"layer": lyr.name(), "selected": count, "extent": _extent_list(iface.mapCanvas().extent())}
+
+
+# ---------------------------------------------------------------- files
+
+@tool("list_directory", "List files and folders inside a directory (name, kind, size). Max 500 entries.", params={
+    "path": {"type": "string", "required": True, "description": "Absolute directory path"},
+})
+def list_directory(path):
+    if not os.path.isdir(path):
+        raise ToolError("Not a directory: %s" % path, code="not_found")
+    entries = []
+    truncated = False
+    for i, entry in enumerate(sorted(os.listdir(path))):
+        if i >= 500:
+            truncated = True
+            break
+        full = os.path.join(path, entry)
+        is_dir = os.path.isdir(full)
+        size = None
+        if not is_dir:
+            try:
+                size = os.path.getsize(full)
+            except OSError:
+                size = None
+        entries.append({"name": entry, "kind": "dir" if is_dir else "file", "size": size})
+    return {"path": path, "count": len(entries), "truncated": truncated, "entries": entries}
+
+
+@tool("move_file", "Move or rename a file or folder on disk. Creates destination folders as needed; the destination must not exist.", params={
+    "src": {"type": "string", "required": True, "description": "Absolute path of the source file or folder"},
+    "dst": {"type": "string", "required": True, "description": "Absolute destination path"},
+}, mutates=True)
+def move_file(src, dst):
+    if not os.path.exists(src):
+        raise ToolError("Source not found: %s" % src, code="not_found")
+    dst = os.path.abspath(dst)
+    if os.path.exists(dst):
+        raise ToolError("Destination already exists: %s" % dst, code="io_error")
+    parent = os.path.dirname(dst)
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as exc:
+            raise ToolError("Could not create %s: %s" % (parent, exc), code="io_error")
+    try:
+        shutil.move(src, dst)
+    except (OSError, shutil.Error) as exc:
+        raise ToolError("Move failed: %s" % exc, code="io_error")
+    return {"moved": src, "to": dst}
 
 
 # ---------------------------------------------------------------- processing

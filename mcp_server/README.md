@@ -50,17 +50,18 @@ uvx --from "git+https://github.com/pepehalfonso/copla-plugin#subdirectory=mcp_se
 }
 ```
 
-## Tools (31)
+## Tools (37)
 
 | Group | Tools |
 |---|---|
 | Health | `diagnose`, `list_qgis_tools` |
 | Project | `get_project_info`, `load_project`, `save_project`, `set_project_crs` |
-| Layers | `list_layers`, `get_layer_info`, `add_layer`, `add_basemap`, `remove_layer`, `rename_layer`, `set_layer_visibility`, `zoom_to_layer` |
+| Layers | `list_layers`, `get_layer_info`, `add_layer`, `create_layer`, `download_layer`, `http_get`, `save_layer_as`, `add_basemap`, `remove_layer`, `rename_layer`, `set_layer_visibility`, `zoom_to_layer` |
 | Features | `get_features`, `select_features`, `run_expression` |
 | Editing | `add_features`, `update_attributes`, `delete_features` |
 | Style | `set_renderer`, `set_labels` |
 | View & selection | `set_extent`, `clear_selection`, `zoom_to_selection` |
+| Files | `list_directory`, `move_file` |
 | Processing | `search_algorithms`, `get_algorithm_info`, `run_algorithm` |
 | Output | `render_map`, `list_layouts`, `export_layout` |
 

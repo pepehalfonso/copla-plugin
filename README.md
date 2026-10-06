@@ -29,15 +29,21 @@ PyQGIS: capas, features, Processing, layouts, renders
 
 ![Panel Copla](docs/screenshots/shot-panel.png)
 
+![Chat embebido](docs/screenshots/shot-chat.png)
+
 ## Qué hace
 
-- **31 herramientas tipadas**: capas, features, edición de datos,
-  simbología, algoritmos de Processing, renders, layouts y proyectos —
+- **37 herramientas tipadas**: capas, features, edición de datos,
+  simbología, descarga de datos de internet, gestión de archivos,
+  algoritmos de Processing, renders, layouts y proyectos —
   todo con parámetros validados.
 - **Sin `execute_python`.** La IA solo puede llamar a operaciones revisadas
   dentro del complemento; no existe endpoint de código arbitrario.
 - **Instalación en 1 clic**: el panel *Copla* dentro de QGIS genera el
   snippet de configuración exacto para tu cliente IA (copiar y pegar).
+- **Chat embebido**: pestaña *Chat* en el mismo panel — proveedor
+  compatible con OpenAI, streaming, tool-calling sobre las herramientas
+  del complemento e historial persistente, sin cliente IA externo.
 - **Auto-descubrimiento**: el lado MCP encuentra QGIS solo, leyendo
   `copla.json` de tu perfil. No hay puertos ni tokens que configurar a mano.
 - **Seguro por defecto**: solo `127.0.0.1`, token aleatorio obligatorio,
@@ -187,17 +193,50 @@ Con QGIS abierto y el cliente conectado, probá algo como:
 > "Listá las capas del proyecto, mostrame las 5 primeras features de la
 > capa X y renderizá un mapa PNG de esa capa en /tmp/salida.png"
 
-## Herramientas (31, tipadas)
+## Chat embebido
+
+El dock *Copla* tiene una pestaña **Chat** con un asistente integrado —
+no necesita un cliente IA externo:
+
+- **Proveedor a elección** (API compatible con OpenAI), todos presets
+  listos para usar: **MiMo v2.5 Free** (OpenCode Zen), **OpenRouter
+  (modelos free)**, **Groq (free)**, **Google Gemini (free)**, Ollama y
+  LM Studio (locales, sin key), o un endpoint personalizado. Cada preset
+  muestra dónde conseguir la API key gratuita.
+- **Selector de agentes al estilo opencode**: elegís con un clic entre
+  *Copla* (herramientas completas), *Explorador* (solo lectura),
+  *Cartógrafo* (simbología, etiquetas, mapas y layouts), *Editor*
+  (features y capas), *Descargas y archivos* y *General* (chat sin
+  tools). Cada agente tiene su prompt y su conjunto de herramientas; la
+  selección se guarda sola y el historial es compartido.
+- **Streaming** en tiempo real con **tool-calling** sobre el mismo
+  registro de herramientas tipadas del complemento (máx. 8 pasos por
+  turno, sin ejecución de código arbitrario).
+- **Historial persistente** entre sesiones y **prompt de sistema
+  editable**.
+- Puede **descargar capas de internet**, gestionar archivos locales,
+  editar datos y todo lo que hace una IA externa — porque usa las
+  mismas herramientas.
+- La configuración (URL, clave, modelo, prompt) se guarda en tu perfil
+  (`copla_chat.json`) y la conversación en `copla_chat_history.json`;
+  la clave nunca sale de tu equipo.
+
+Uso: pestaña *Chat* → *Configuración* → elegir proveedor, pegar la API
+key, *Guardar*, y escribir algo como *“descargá los países de
+world.geo.json y pintalos por continente”*.
+
+## Herramientas (37, tipadas)
 
 | Grupo | Herramientas |
 |---|---|
 | Salud | `diagnose`, `list_qgis_tools` |
 | Proyecto | `get_project_info`, `load_project`, `save_project`, `set_project_crs` |
-| Capas | `list_layers`, `get_layer_info`, `add_layer`, `add_basemap`, `remove_layer`, `rename_layer`, `set_layer_visibility`, `zoom_to_layer` |
+| Capas | `list_layers`, `get_layer_info`, `add_layer`, `create_layer`, `download_layer`, `http_get`, `save_layer_as`, `add_basemap`, `remove_layer`, `rename_layer`, `set_layer_visibility`, `zoom_to_layer` |
 | Features | `get_features`, `select_features`, `run_expression` |
 | Edición | `add_features`, `update_attributes`, `delete_features` |
 | Estilo | `set_renderer`, `set_labels` |
 | Vista y selección | `set_extent`, `clear_selection`, `zoom_to_selection` |
+| Archivos | `list_directory`, `move_file` |
 | Processing | `search_algorithms`, `get_algorithm_info`, `run_algorithm` |
 | Salida | `render_map`, `list_layouts`, `export_layout` |
 
