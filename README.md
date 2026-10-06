@@ -31,8 +31,9 @@ PyQGIS: capas, features, Processing, layouts, renders
 
 ## Qué hace
 
-- **20 herramientas tipadas**: capas, features, algoritmos de Processing,
-  renders, layouts y proyectos — todo con parámetros validados.
+- **31 herramientas tipadas**: capas, features, edición de datos,
+  simbología, algoritmos de Processing, renders, layouts y proyectos —
+  todo con parámetros validados.
 - **Sin `execute_python`.** La IA solo puede llamar a operaciones revisadas
   dentro del complemento; no existe endpoint de código arbitrario.
 - **Instalación en 1 clic**: el panel *Copla* dentro de QGIS genera el
@@ -186,15 +187,18 @@ Con QGIS abierto y el cliente conectado, probá algo como:
 > "Listá las capas del proyecto, mostrame las 5 primeras features de la
 > capa X y renderizá un mapa PNG de esa capa en /tmp/salida.png"
 
-## Herramientas (20, tipadas)
+## Herramientas (31, tipadas)
 
 | Grupo | Herramientas |
 |---|---|
 | Salud | `diagnose`, `list_qgis_tools` |
-| Proyecto | `get_project_info`, `load_project`, `save_project` |
-| Capas | `list_layers`, `get_layer_info`, `add_layer`, `remove_layer`, `rename_layer`, `set_layer_visibility`, `zoom_to_layer` |
+| Proyecto | `get_project_info`, `load_project`, `save_project`, `set_project_crs` |
+| Capas | `list_layers`, `get_layer_info`, `add_layer`, `add_basemap`, `remove_layer`, `rename_layer`, `set_layer_visibility`, `zoom_to_layer` |
 | Features | `get_features`, `select_features`, `run_expression` |
-| Processing | `search_algorithms`, `run_algorithm` |
+| Edición | `add_features`, `update_attributes`, `delete_features` |
+| Estilo | `set_renderer`, `set_labels` |
+| Vista y selección | `set_extent`, `clear_selection`, `zoom_to_selection` |
+| Processing | `search_algorithms`, `get_algorithm_info`, `run_algorithm` |
 | Salida | `render_map`, `list_layouts`, `export_layout` |
 
 ## Seguridad

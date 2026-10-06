@@ -76,6 +76,12 @@ def save_project(path: str | None = None) -> dict:
     return _call("save_project", {"path": path} if path else {})
 
 
+@mcp.tool()
+def set_project_crs(crs: str) -> dict:
+    """Set the project CRS, e.g. 'EPSG:4326'. Layers reproject on the fly."""
+    return _call("set_project_crs", {"crs": crs})
+
+
 # ------------------------------------------------------------------ layers
 
 @mcp.tool()
@@ -125,6 +131,17 @@ def zoom_to_layer(layer: str) -> dict:
     return _call("zoom_to_layer", {"layer": layer})
 
 
+@mcp.tool()
+def add_basemap(style: str = "osm", url: str | None = None, name: str | None = None) -> dict:
+    """Add an XYZ basemap (style='osm'|'satellite') or a custom XYZ tile URL with {z}/{x}/{y} placeholders, at the bottom of the layer list."""
+    args: dict[str, Any] = {"style": style}
+    if url:
+        args["url"] = url
+    if name:
+        args["name"] = name
+    return _call("add_basemap", args)
+
+
 # ------------------------------------------------------------------ features
 
 @mcp.tool()
@@ -166,12 +183,130 @@ def run_expression(
     return _call("run_expression", args)
 
 
+@mcp.tool()
+def add_features(layer: str, features: list[dict]) -> dict:
+    """Add features to a vector layer. Each item: {"geometry": "WKT", "attributes": {"field": value}}. Geometry optional for table layers; max 500 per call. Edits are committed."""
+    return _call("add_features", {"layer": layer, "features": features})
+
+
+@mcp.tool()
+def delete_features(
+    layer: str,
+    expression: str | None = None,
+    feature_ids: list[int] | None = None,
+) -> dict:
+    """Delete features from a vector layer by QGIS expression or by feature ids (exactly one of the two). Committed when done."""
+    args: dict[str, Any] = {"layer": layer}
+    if expression:
+        args["expression"] = expression
+    if feature_ids:
+        args["feature_ids"] = feature_ids
+    return _call("delete_features", args)
+
+
+@mcp.tool()
+def update_attributes(
+    layer: str,
+    values: dict,
+    expression: str | None = None,
+    feature_ids: list[int] | None = None,
+) -> dict:
+    """Update attribute values on existing features selected by expression or feature ids, e.g. values={"pop": 1200}."""
+    args: dict[str, Any] = {"layer": layer, "values": values}
+    if expression:
+        args["expression"] = expression
+    if feature_ids:
+        args["feature_ids"] = feature_ids
+    return _call("update_attributes", args)
+
+
+# ------------------------------------------------------------------ style
+
+@mcp.tool()
+def set_renderer(
+    layer: str,
+    type: str,
+    field: str | None = None,
+    color: str | None = None,
+    colors: list[str] | None = None,
+    ramp: str | None = None,
+    classes: int | None = None,
+) -> dict:
+    """Set vector symbology: type='single' (one color), 'categorized' (unique values of field) or 'graduated' (numeric classes with a color ramp such as 'Spectral' or 'Blues')."""
+    args: dict[str, Any] = {"layer": layer, "type": type}
+    if field:
+        args["field"] = field
+    if color:
+        args["color"] = color
+    if colors:
+        args["colors"] = colors
+    if ramp:
+        args["ramp"] = ramp
+    if classes is not None:
+        args["classes"] = classes
+    return _call("set_renderer", args)
+
+
+@mcp.tool()
+def set_labels(
+    layer: str,
+    enabled: bool,
+    field: str | None = None,
+    size: float = 10.0,
+    color: str = "#000000",
+    halo: bool = True,
+    expression: bool = False,
+) -> dict:
+    """Configure labels on a vector layer: enabled=false hides them; enabling requires field (or expression), with optional size, color and white halo."""
+    args: dict[str, Any] = {"layer": layer, "enabled": enabled}
+    if field:
+        args["field"] = field
+    if size is not None:
+        args["size"] = size
+    if color:
+        args["color"] = color
+    if halo is not None:
+        args["halo"] = halo
+    if expression:
+        args["expression"] = expression
+    return _call("set_labels", args)
+
+
+# ------------------------------------------------------------------ view & selection
+
+@mcp.tool()
+def set_extent(extent: list[float], crs: str | None = None) -> dict:
+    """Zoom the map canvas to an extent [xmin, ymin, xmax, ymax], optionally in another CRS (e.g. 'EPSG:4326')."""
+    args: dict[str, Any] = {"extent": extent}
+    if crs:
+        args["crs"] = crs
+    return _call("set_extent", args)
+
+
+@mcp.tool()
+def clear_selection(layer: str | None = None) -> dict:
+    """Clear the feature selection on a layer, or on all layers if layer is omitted."""
+    return _call("clear_selection", {"layer": layer} if layer else {})
+
+
+@mcp.tool()
+def zoom_to_selection(layer: str) -> dict:
+    """Zoom the map canvas to the selected features of a layer."""
+    return _call("zoom_to_selection", {"layer": layer})
+
+
 # ------------------------------------------------------------------ processing
 
 @mcp.tool()
 def search_algorithms(query: str = "", limit: int = 15) -> list[dict]:
     """Search Processing algorithms by keyword; returns ids for run_algorithm."""
     return _call("search_algorithms", {"query": query, "limit": limit})["algorithms"]
+
+
+@mcp.tool()
+def get_algorithm_info(id: str) -> dict:
+    """Describe a Processing algorithm: parameter names, types, defaults, enum options, outputs and help text. Use before run_algorithm to fill params correctly."""
+    return _call("get_algorithm_info", {"id": id})
 
 
 @mcp.tool()

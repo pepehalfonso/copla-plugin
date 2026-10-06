@@ -41,11 +41,14 @@ async def main():
             print("MCP tools (%d): %s" % (len(names), ", ".join(names)))
             expected = {
                 "diagnose", "list_qgis_tools", "get_project_info", "load_project",
-                "save_project", "list_layers", "get_layer_info", "add_layer",
-                "remove_layer", "rename_layer", "set_layer_visibility",
-                "zoom_to_layer", "get_features", "select_features",
-                "run_expression", "search_algorithms", "run_algorithm",
-                "render_map", "list_layouts", "export_layout",
+                "save_project", "set_project_crs", "list_layers", "get_layer_info",
+                "add_layer", "add_basemap", "remove_layer", "rename_layer",
+                "set_layer_visibility", "zoom_to_layer", "get_features",
+                "select_features", "run_expression", "add_features",
+                "update_attributes", "delete_features", "set_renderer",
+                "set_labels", "set_extent", "clear_selection",
+                "zoom_to_selection", "search_algorithms", "get_algorithm_info",
+                "run_algorithm", "render_map", "list_layouts", "export_layout",
             }
             missing = expected - set(names)
             assert not missing, "missing tools: %s" % missing
@@ -68,6 +71,17 @@ async def main():
             algs = payload(r)
             print("search_algorithms ->", json.dumps(algs, ensure_ascii=False)[:300])
             assert not r.is_error and algs
+
+            r = await session.call_tool("get_algorithm_info", {"id": "native:buffer"})
+            info = payload(r)
+            print("get_algorithm_info ->", json.dumps(info, ensure_ascii=False)[:300])
+            assert not r.is_error
+            pnames = [p["name"] for p in info["parameters"]]
+            assert "DISTANCE" in pnames, "buffer should expose DISTANCE"
+
+            r = await session.call_tool("clear_selection", {})
+            print("clear_selection ->", payload(r))
+            assert not r.is_error
 
             r = await session.call_tool("get_layer_info", {"layer": "no-existe-xyz"})
             err_text = str(payload(r))

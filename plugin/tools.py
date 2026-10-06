@@ -11,20 +11,36 @@ import sys
 from qgis.core import (
     Qgis,
     QgsApplication,
+    QgsCategorizedSymbolRenderer,
     QgsCoordinateReferenceSystem,
+    QgsCoordinateTransform,
     QgsExpression,
     QgsExpressionContext,
+    QgsFeature,
     QgsFeatureRequest,
+    QgsGeometry,
+    QgsGraduatedSymbolRenderer,
     QgsLayoutExporter,
     QgsMapRendererSequentialJob,
+    QgsPalLayerSettings,
     QgsProcessingFeedback,
+    QgsProcessingParameterDefinition,
     QgsProject,
     QgsRasterLayer,
     QgsRectangle,
+    QgsRendererCategory,
+    QgsRendererRange,
+    QgsSingleSymbolRenderer,
+    QgsStyle,
+    QgsSymbol,
+    QgsTextBufferSettings,
+    QgsTextFormat,
     QgsVectorLayer,
+    QgsVectorLayerSimpleLabeling,
     QgsWkbTypes,
 )
 from qgis.PyQt.QtCore import QSize
+from qgis.PyQt.QtGui import QColor
 from qgis.utils import iface
 
 try:
@@ -191,6 +207,69 @@ def _rect_from(value):
         )
 
 
+_PALETTE = [
+    "#e41a1c",
+    "#377eb8",
+    "#4daf4a",
+    "#984ea3",
+    "#ff7f00",
+    "#ffff33",
+    "#a65628",
+    "#f781bf",
+    "#66c2a5",
+    "#fc8d62",
+]
+
+
+def _field_index(lyr, field):
+    idx = lyr.fields().indexFromName(field)
+    if idx < 0:
+        raise ToolError(
+            "Unknown field '%s'. Available: %s"
+            % (field, ", ".join(f.name() for f in lyr.fields()) or "(none)"),
+            code="bad_args",
+        )
+    return idx
+
+
+def _qcolor(value, param="color"):
+    color = QColor(value)
+    if not color.isValid():
+        raise ToolError(
+            "%s must be a valid color, e.g. '#ff0000' or 'red'" % param,
+            code="bad_args",
+        )
+    return color
+
+
+def _make_ramp(name):
+    style = QgsStyle.defaultStyle()
+    if name:
+        ramp = style.colorRamp(name)
+        if ramp is None:
+            names = sorted(style.colorRampNames())
+            raise ToolError(
+                "Color ramp '%s' not found. Available: %s"
+                % (name, ", ".join(names[:20]) + (", ..." if len(names) > 20 else "")),
+                code="bad_args",
+            )
+        return ramp
+    ramp = style.colorRamp("Spectral")
+    if ramp is None:
+        raise ToolError("Default color ramp 'Spectral' is unavailable", code="tool_error")
+    return ramp
+
+
+def _vector_layer(layer, tool_name="This tool"):
+    lyr = find_layer(layer)
+    if not isinstance(lyr, QgsVectorLayer):
+        raise ToolError(
+            "%s requires a vector layer; '%s' is not one" % (tool_name, lyr.name()),
+            code="bad_args",
+        )
+    return lyr
+
+
 class _CollectFeedback(QgsProcessingFeedback):
     def __init__(self):
         super().__init__()
@@ -275,6 +354,22 @@ def save_project(path=None):
     if not ok:
         raise ToolError("Could not write project to %s" % target, code="io_error")
     return {"saved": os.path.abspath(target)}
+
+
+@tool("set_project_crs", "Set the project CRS, e.g. 'EPSG:4326'. Layers reproject on the fly.", params={
+    "crs": {"type": "string", "required": True, "description": "CRS identifier, e.g. EPSG:4326 or EPSG:32721"},
+}, mutates=True)
+def set_project_crs(crs):
+    target = QgsCoordinateReferenceSystem(crs)
+    if not target.isValid():
+        raise ToolError(
+            "Invalid CRS: %s (use an authid like EPSG:4326)" % crs,
+            code="bad_args",
+        )
+    _project().setCrs(target)
+    if iface is not None:
+        iface.mapCanvas().refresh()
+    return {"crs": target.authid(), "name": target.description()}
 
 
 # ---------------------------------------------------------------- layers
@@ -383,6 +478,42 @@ def zoom_to_layer(layer):
     return {"zoomed_to": lyr.name()}
 
 
+@tool("add_basemap", "Add an XYZ basemap (OpenStreetMap or satellite imagery) or a custom XYZ tile URL, placed at the bottom of the layer list.", params={
+    "style": {"type": "string", "required": False, "enum": ["osm", "satellite"], "description": "Basemap style (default osm); ignored if url is given"},
+    "url": {"type": "string", "required": False, "description": "Custom XYZ tile URL with {z}/{x}/{y} placeholders"},
+    "name": {"type": "string", "required": False, "description": "Display name for the basemap layer"},
+}, mutates=True)
+def add_basemap(style="osm", url=None, name=None):
+    templates = {
+        "osm": ("OpenStreetMap", "https://tile.openstreetmap.org/{z}/{x}/{y}.png"),
+        "satellite": ("Esri Satellite", "https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"),
+    }
+    if url:
+        for token in ("{z}", "{x}", "{y}"):
+            if token not in url:
+                raise ToolError("Custom url must contain %s placeholders" % token, code="bad_args")
+        tile_url = url
+        label = name or "XYZ basemap"
+    else:
+        if style not in templates:
+            raise ToolError("style must be one of: %s" % ", ".join(templates), code="bad_args")
+        label, tile_url = templates[style]
+        if name:
+            label = name
+    layer = QgsRasterLayer("type=xyz&url=%s" % tile_url, label, "wms")
+    if not layer.isValid():
+        raise ToolError(
+            "Could not load the basemap layer (check network access and url)",
+            code="io_error",
+        )
+    project = _project()
+    project.addMapLayer(layer, False)
+    project.layerTreeRoot().addLayer(layer)
+    if iface is not None:
+        iface.mapCanvas().refresh()
+    return layer_summary(layer)
+
+
 # ---------------------------------------------------------------- features
 
 @tool("get_features", "Read features from a vector layer as JSON records. Supports an optional subset filter (QGIS expression) and field selection.", params={
@@ -414,7 +545,7 @@ def get_features(layer, limit=50, filter=None, fields=None, include_geometry=Fal
                 code="bad_args",
             )
         wanted = list(fields)
-        request.setSubsetOfNames(wanted)
+        request.setSubsetOfAttributes([lyr.fields().indexFromName(n) for n in wanted])
     out = []
     total = 0
     for feat in lyr.getFeatures(request):
@@ -515,6 +646,314 @@ def run_expression(layer, expression, feature_id=None, aggregate=None):
     return {"feature_id": feature_id, "value": value if isinstance(value, (int, float, str, bool)) else str(value)}
 
 
+def _resolve_fids(lyr, expression, feature_ids):
+    if expression and feature_ids:
+        raise ToolError("Provide expression or feature_ids, not both", code="bad_args")
+    if not expression and not feature_ids:
+        raise ToolError("Provide expression or feature_ids", code="bad_args")
+    if expression:
+        probe = QgsExpression(expression)
+        if probe.hasParserError():
+            raise ToolError("Expression parse error: %s" % probe.parserErrorString(), code="bad_args")
+        request = QgsFeatureRequest().setFilterExpression(expression)
+        fids = [f.id() for f in lyr.getFeatures(request)]
+    else:
+        fids = [int(v) for v in feature_ids]
+    if len(fids) > 5000:
+        raise ToolError(
+            "Too many features match (%d, limit 5000); refine the expression" % len(fids),
+            code="bad_args",
+        )
+    return fids
+
+
+@tool("add_features", "Add features to a vector layer. Each item: {\"geometry\": \"WKT\", \"attributes\": {\"field\": value}}. Geometry is optional for table layers. Edits are committed when done.", params={
+    "layer": {"type": "string", "required": True, "description": "Vector layer id or name (must be editable)"},
+    "features": {"type": "array", "required": True, "description": "List of {geometry (WKT), attributes (object)}; max 500 per call"},
+}, mutates=True)
+def add_features(layer, features):
+    lyr = _vector_layer(layer, "add_features")
+    if len(features) > 500:
+        raise ToolError("Too many features in one call (limit 500)", code="bad_args")
+    if not lyr.startEditing():
+        raise ToolError(
+            "Layer '%s' is not editable (read-only provider?)" % lyr.name(),
+            code="tool_error",
+        )
+    fields = lyr.fields()
+    added = 0
+    try:
+        for item in features:
+            if not isinstance(item, dict):
+                raise ToolError("Each feature must be an object with geometry/attributes", code="bad_args")
+            attrs = item.get("attributes") or {}
+            if not isinstance(attrs, dict):
+                raise ToolError("'attributes' must be an object", code="bad_args")
+            feat = QgsFeature(fields)
+            for key, value in attrs.items():
+                feat.setAttribute(_field_index(lyr, key), value)
+            wkt = item.get("geometry")
+            if wkt:
+                geom = QgsGeometry.fromWkt(str(wkt))
+                if geom is None or geom.isEmpty():
+                    raise ToolError("Invalid geometry (not valid WKT): %s" % str(wkt)[:80], code="bad_args")
+                if geom.type() != lyr.geometryType():
+                    raise ToolError(
+                        "Geometry type mismatch: layer is %s, got %s"
+                        % (QgsWkbTypes.geometryDisplayString(lyr.geometryType()),
+                           QgsWkbTypes.geometryDisplayString(geom.type())),
+                        code="bad_args",
+                    )
+                if QgsWkbTypes.isMultiType(lyr.wkbType()) and not geom.isMultipart():
+                    geom.convertToMultiType()
+                elif not QgsWkbTypes.isMultiType(lyr.wkbType()) and geom.isMultipart():
+                    if not geom.convertToSingleType():
+                        raise ToolError("Multi-part geometry does not fit a single-part layer", code="bad_args")
+                feat.setGeometry(geom)
+            if not lyr.addFeature(feat):
+                raise ToolError("QGIS rejected a feature (check attributes/geometry)", code="tool_error")
+            added += 1
+        if not lyr.commitChanges():
+            raise ToolError("Could not commit the new features", code="tool_error")
+    except Exception:
+        lyr.rollBack()
+        raise
+    if iface is not None:
+        lyr.triggerRepaint()
+    return {"layer": lyr.name(), "added": added}
+
+
+@tool("delete_features", "Delete features from a vector layer, selected by QGIS expression or by feature ids. Edits are committed when done.", params={
+    "layer": {"type": "string", "required": True, "description": "Vector layer id or name (must be editable)"},
+    "expression": {"type": "string", "required": False, "description": "QGIS expression; all matching features are deleted, e.g. pop = 0"},
+    "feature_ids": {"type": "array", "required": False, "description": "Feature ids to delete (alternative to expression)"},
+}, mutates=True)
+def delete_features(layer, expression=None, feature_ids=None):
+    lyr = _vector_layer(layer, "delete_features")
+    fids = _resolve_fids(lyr, expression, feature_ids)
+    if not fids:
+        return {"layer": lyr.name(), "deleted": 0, "note": "No features matched"}
+    if not lyr.startEditing():
+        raise ToolError("Layer '%s' is not editable" % lyr.name(), code="tool_error")
+    try:
+        if not lyr.deleteFeatures(fids):
+            raise ToolError("QGIS could not delete the features", code="tool_error")
+        if not lyr.commitChanges():
+            raise ToolError("Could not commit the deletion", code="tool_error")
+    except Exception:
+        lyr.rollBack()
+        raise
+    if iface is not None:
+        lyr.triggerRepaint()
+    return {"layer": lyr.name(), "deleted": len(fids)}
+
+
+@tool("update_attributes", "Update attribute values on existing features (by expression or feature ids). Example values: {\"pop\": 1200, \"name\": \"new\"}.", params={
+    "layer": {"type": "string", "required": True, "description": "Vector layer id or name (must be editable)"},
+    "values": {"type": "object", "required": True, "description": "Object of field name → new value"},
+    "expression": {"type": "string", "required": False, "description": "QGIS expression selecting the features to update"},
+    "feature_ids": {"type": "array", "required": False, "description": "Feature ids to update (alternative to expression)"},
+}, mutates=True)
+def update_attributes(layer, values, expression=None, feature_ids=None):
+    lyr = _vector_layer(layer, "update_attributes")
+    if not values:
+        raise ToolError("'values' must not be empty", code="bad_args")
+    fids = _resolve_fids(lyr, expression, feature_ids)
+    if not fids:
+        return {"layer": lyr.name(), "updated": 0, "note": "No features matched"}
+    indexes = {key: _field_index(lyr, key) for key in values}
+    if not lyr.startEditing():
+        raise ToolError("Layer '%s' is not editable" % lyr.name(), code="tool_error")
+    updated = 0
+    try:
+        for fid in fids:
+            feat = lyr.getFeature(fid)
+            if not feat.isValid():
+                raise ToolError("Feature with id %s not found" % fid, code="not_found")
+            for key, value in values.items():
+                feat.setAttribute(indexes[key], value)
+            if not lyr.updateFeature(feat):
+                raise ToolError("QGIS rejected the update on feature %s" % fid, code="tool_error")
+            updated += 1
+        if not lyr.commitChanges():
+            raise ToolError("Could not commit the changes", code="tool_error")
+    except Exception:
+        lyr.rollBack()
+        raise
+    if iface is not None:
+        lyr.triggerRepaint()
+    return {"layer": lyr.name(), "updated": updated, "fields": list(values)}
+
+
+# ---------------------------------------------------------------- style
+
+@tool("set_renderer", "Set vector layer symbology: 'single' (one color), 'categorized' (unique values of a field) or 'graduated' (numeric classes). Optionally pass custom colors or a color ramp name.", params={
+    "layer": {"type": "string", "required": True, "description": "Vector layer id or name"},
+    "type": {"type": "string", "required": True, "enum": ["single", "categorized", "graduated"], "description": "Renderer type"},
+    "field": {"type": "string", "required": False, "description": "Field for categorized/graduated (required for those types)"},
+    "color": {"type": "string", "required": False, "description": "Fill color for type=single, e.g. '#4daf4a' (default green)"},
+    "colors": {"type": "array", "required": False, "description": "Custom color list for categories (cycles if shorter than classes)"},
+    "ramp": {"type": "string", "required": False, "description": "Color ramp name for graduated, e.g. 'Spectral', 'Blues', 'Reds', 'YlOrRd' (default Spectral)"},
+    "classes": {"type": "integer", "required": False, "description": "Number of classes for graduated (default 5, max 20)"},
+}, mutates=True)
+def set_renderer(layer, type, field=None, color=None, colors=None, ramp=None, classes=None):
+    lyr = _vector_layer(layer, "set_renderer")
+    gtype = lyr.geometryType()
+    if type in ("categorized", "graduated") and not field:
+        raise ToolError("field is required for type='%s'" % type, code="bad_args")
+    if type == "single":
+        symbol = QgsSymbol.defaultSymbol(gtype)
+        symbol.setColor(_qcolor(color) if color else QColor("#4daf4a"))
+        renderer = QgsSingleSymbolRenderer(symbol)
+    elif type == "categorized":
+        idx = _field_index(lyr, field)
+        values = lyr.uniqueValues(idx)
+        if len(values) > 40:
+            raise ToolError(
+                "%d unique values in '%s' (limit 40); use type='graduated'"
+                % (len(values), field),
+                code="bad_args",
+            )
+        palette = [_qcolor(c, "colors") for c in (colors or _PALETTE)]
+        categories = []
+        for i, value in enumerate(sorted(values, key=lambda v: (v is None, str(v)))):
+            symbol = QgsSymbol.defaultSymbol(gtype)
+            symbol.setColor(palette[i % len(palette)])
+            label = "(empty)" if value is None or value == "" else str(value)
+            categories.append(QgsRendererCategory(value, symbol, label))
+        renderer = QgsCategorizedSymbolRenderer(field, categories)
+    else:
+        idx = _field_index(lyr, field)
+        if not lyr.fields()[idx].isNumeric():
+            raise ToolError("Field '%s' is not numeric; use type='categorized'" % field, code="bad_args")
+        mn = lyr.minimumValue(idx)
+        mx = lyr.maximumValue(idx)
+        if mn is None or mx is None:
+            raise ToolError("Field '%s' has no values" % field, code="tool_error")
+        mn, mx = float(mn), float(mx)
+        n = max(2, min(int(classes or 5), 20))
+        ramp_obj = _make_ramp(ramp)
+        ranges = []
+        if mn == mx:
+            symbol = QgsSymbol.defaultSymbol(gtype)
+            symbol.setColor(ramp_obj.color(0.5))
+            ranges.append(QgsRendererRange(mn, mx, symbol, str(mn)))
+        else:
+            step = (mx - mn) / n
+            for i in range(n):
+                lo = mn + i * step
+                hi = mx if i == n - 1 else mn + (i + 1) * step
+                symbol = QgsSymbol.defaultSymbol(gtype)
+                symbol.setColor(ramp_obj.color((i + 0.5) / n))
+                ranges.append(QgsRendererRange(lo, hi, symbol, "%.6g - %.6g" % (lo, hi)))
+        renderer = QgsGraduatedSymbolRenderer(field, ranges)
+    lyr.setRenderer(renderer)
+    if iface is not None:
+        lyr.triggerRepaint()
+    return {"layer": lyr.name(), "renderer": type, "field": field}
+
+
+@tool("set_labels", "Configure labels on a vector layer (enable with a field, size, color and optional white halo, or pass enabled=false to turn labels off).", params={
+    "layer": {"type": "string", "required": True, "description": "Vector layer id or name"},
+    "enabled": {"type": "boolean", "required": True, "description": "true to show labels, false to hide them"},
+    "field": {"type": "string", "required": False, "description": "Field name, or expression if expression=true (required when enabling)"},
+    "size": {"type": "number", "required": False, "description": "Label size in points (default 10)"},
+    "color": {"type": "string", "required": False, "description": "Text color (default '#000000')"},
+    "halo": {"type": "boolean", "required": False, "description": "White halo behind text (default true)"},
+    "expression": {"type": "boolean", "required": False, "description": "Treat 'field' as a QGIS expression (default false)"},
+}, mutates=True)
+def set_labels(layer, enabled, field=None, size=10, color="#000000", halo=True, expression=False):
+    lyr = _vector_layer(layer, "set_labels")
+    if not enabled:
+        lyr.setLabelsEnabled(False)
+        if iface is not None:
+            lyr.triggerRepaint()
+        return {"layer": lyr.name(), "labels": False}
+    if not field:
+        raise ToolError("field is required when enabled=true", code="bad_args")
+    if not expression:
+        _field_index(lyr, field)
+    settings = QgsPalLayerSettings()
+    settings.fieldName = field
+    settings.isExpression = bool(expression)
+    text = QgsTextFormat()
+    text.setSize(float(size))
+    text.setColor(_qcolor(color))
+    if halo:
+        buffer = QgsTextBufferSettings()
+        buffer.setEnabled(True)
+        buffer.setSize(1.5)
+        buffer.setColor(QColor("#ffffff"))
+        text.setBuffer(buffer)
+    settings.setFormat(text)
+    lyr.setLabeling(QgsVectorLayerSimpleLabeling(settings))
+    lyr.setLabelsEnabled(True)
+    if iface is not None:
+        lyr.triggerRepaint()
+    return {"layer": lyr.name(), "labels": True, "field": field, "size": float(size)}
+
+
+# ---------------------------------------------------------------- view & selection
+
+@tool("set_extent", "Zoom the map canvas to an extent [xmin, ymin, xmax, ymax]. Optionally pass the CRS of those coordinates if it differs from the project CRS.", params={
+    "extent": {"type": "array", "required": True, "description": "[xmin, ymin, xmax, ymax]"},
+    "crs": {"type": "string", "required": False, "description": "CRS of the extent coordinates, e.g. EPSG:4326 (default: project CRS)"},
+}, mutates=True)
+def set_extent(extent, crs=None):
+    if iface is None:
+        raise ToolError("No GUI available (headless session)", code="tool_error")
+    rect = _rect_from(extent)
+    if crs:
+        source = QgsCoordinateReferenceSystem(crs)
+        if not source.isValid():
+            raise ToolError("Invalid CRS: %s" % crs, code="bad_args")
+        target = _project().crs()
+        if source != target:
+            rect = QgsCoordinateTransform(source, target, _project()).transformBoundingBox(rect)
+    canvas = iface.mapCanvas()
+    canvas.setExtent(rect)
+    canvas.refresh()
+    return {"extent": _extent_list(canvas.extent())}
+
+
+@tool("clear_selection", "Clear the feature selection on a layer, or on all layers if 'layer' is omitted.", params={
+    "layer": {"type": "string", "required": False, "description": "Layer id or name (omit to clear all layers)"},
+}, mutates=True)
+def clear_selection(layer=None):
+    project = _project()
+    cleared = []
+    if layer:
+        lyr = _vector_layer(layer, "clear_selection")
+        lyr.removeSelection()
+        cleared.append(lyr.name())
+    else:
+        for candidate in project.mapLayers().values():
+            if isinstance(candidate, QgsVectorLayer) and candidate.selectedFeatureCount() > 0:
+                candidate.removeSelection()
+                cleared.append(candidate.name())
+    if iface is not None:
+        iface.mapCanvas().refresh()
+    return {"cleared": cleared}
+
+
+@tool("zoom_to_selection", "Zoom the map canvas to the selected features of a layer.", params={
+    "layer": {"type": "string", "required": True, "description": "Vector layer id or name with a selection"},
+}, mutates=True)
+def zoom_to_selection(layer):
+    lyr = _vector_layer(layer, "zoom_to_selection")
+    count = lyr.selectedFeatureCount()
+    if count == 0:
+        raise ToolError(
+            "Layer '%s' has no selected features (use select_features first)" % lyr.name(),
+            code="tool_error",
+        )
+    if iface is None:
+        raise ToolError("No GUI available (headless session)", code="tool_error")
+    iface.mapCanvas().zoomToSelected(lyr)
+    iface.mapCanvas().refresh()
+    return {"layer": lyr.name(), "selected": count, "extent": _extent_list(iface.mapCanvas().extent())}
+
+
 # ---------------------------------------------------------------- processing
 
 @tool("search_algorithms", "Search the Processing toolbox for algorithms by keyword (matches id, name and group). Returns algorithm ids usable with run_algorithm.", params={
@@ -538,6 +977,72 @@ def search_algorithms(query="", limit=15):
         if len(results) >= limit:
             break
     return {"count": len(results), "algorithms": results}
+
+
+@tool("get_algorithm_info", "Describe a Processing algorithm: parameters (names, types, defaults, enum options), outputs and help text. Use it before run_algorithm to fill params correctly.", params={
+    "id": {"type": "string", "required": True, "description": "Algorithm id, e.g. native:buffer (find ids with search_algorithms)"},
+})
+def get_algorithm_info(id):
+    if processing is None:
+        raise ToolError("Processing plugin is not available", code="tool_error")
+    alg = QgsApplication.processingRegistry().algorithmById(id)
+    if alg is None:
+        raise ToolError("Unknown algorithm '%s' (use search_algorithms)" % id, code="not_found")
+    parameters = []
+    for p in alg.parameterDefinitions():
+        entry = {
+            "name": p.name(),
+            "description": p.description() or "",
+            "type": p.type(),
+            "default": None,
+            "optional": False,
+            "options": None,
+        }
+        try:
+            default = p.defaultValue()
+            entry["default"] = (
+                default if isinstance(default, (str, int, float, bool)) or default is None
+                else str(default)
+            )
+        except Exception:
+            pass
+        try:
+            entry["optional"] = bool(p.flags() & QgsProcessingParameterDefinition.FlagOptional)
+        except AttributeError:
+            try:
+                entry["optional"] = bool(p.flags() & Qgis.ProcessingParameterFlag.Optional)
+            except Exception:
+                pass
+        try:
+            options = p.options()
+            if options and isinstance(options[0], str):
+                entry["options"] = [str(o) for o in options]
+        except Exception:
+            pass
+        if entry["options"] is None:
+            try:
+                choices = p.choices()
+                if choices and isinstance(choices[0], str):
+                    entry["options"] = [str(c) for c in choices]
+            except Exception:
+                pass
+        parameters.append(entry)
+    outputs = [
+        {"name": o.name(), "description": o.description() or ""}
+        for o in alg.outputDefinitions()
+    ]
+    try:
+        help_text = (alg.shortHelpString() or "")[:600]
+    except Exception:
+        help_text = ""
+    return {
+        "id": alg.id(),
+        "name": alg.displayName(),
+        "group": alg.group(),
+        "help": help_text,
+        "parameters": parameters,
+        "outputs": outputs,
+    }
 
 
 @tool("run_algorithm", "Run a Processing algorithm synchronously and return its outputs. Find ids with search_algorithms. Layer arguments accept a layer id or name. Can take minutes for heavy algorithms - QGIS stays responsive between requests but this call blocks until finished.", params={
