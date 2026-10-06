@@ -31,6 +31,8 @@ PyQGIS: capas, features, Processing, layouts, renders
 
 ![Chat embebido](docs/screenshots/shot-chat.png)
 
+![Chat embebido — estado inicial](docs/screenshots/shot-chat-empty.png)
+
 ## Qué hace
 
 - **37 herramientas tipadas**: capas, features, edición de datos,
@@ -41,9 +43,10 @@ PyQGIS: capas, features, Processing, layouts, renders
   dentro del complemento; no existe endpoint de código arbitrario.
 - **Instalación en 1 clic**: el panel *Copla* dentro de QGIS genera el
   snippet de configuración exacto para tu cliente IA (copiar y pegar).
-- **Chat embebido**: pestaña *Chat* en el mismo panel — proveedor
-  compatible con OpenAI, streaming, tool-calling sobre las herramientas
-  del complemento e historial persistente, sin cliente IA externo.
+- **Chat embebido**: pestaña *Chat* en el mismo panel — **sale
+  funcionando sin API key** (preset *Gratis*), con streaming,
+  tool-calling sobre las herramientas del complemento, selector de
+  agentes e historial persistente, sin cliente IA externo.
 - **Auto-descubrimiento**: el lado MCP encuentra QGIS solo, leyendo
   `copla.json` de tu perfil. No hay puertos ni tokens que configurar a mano.
 - **Seguro por defecto**: solo `127.0.0.1`, token aleatorio obligatorio,
@@ -198,11 +201,14 @@ Con QGIS abierto y el cliente conectado, probá algo como:
 El dock *Copla* tiene una pestaña **Chat** con un asistente integrado —
 no necesita un cliente IA externo:
 
-- **Proveedor a elección** (API compatible con OpenAI), todos presets
-  listos para usar: **MiMo v2.5 Free** (OpenCode Zen), **OpenRouter
-  (modelos free)**, **Groq (free)**, **Google Gemini (free)**, Ollama y
-  LM Studio (locales, sin key), o un endpoint personalizado. Cada preset
-  muestra dónde conseguir la API key gratuita.
+- **Cero configuración**: recién instalado ya funciona con el preset
+  **Gratis (sin API key)** (Pollinations.AI: sin registro, compatible
+  con OpenAI, con límites de uso comunitarios). Si querés otro
+  proveedor, hay presets listos: **OpenRouter (modelos free)**,
+  **Groq (free)**, **Google Gemini (free)**, **MiMo v2.5 Free**
+  (OpenCode Zen, con key propia de opencode.ai), Ollama y LM Studio
+  (locales, sin key) o un endpoint personalizado. Cambiar de proveedor
+  es elegirlo en el menú; cada preset explica dónde conseguir la key.
 - **Selector de agentes al estilo opencode**: elegís con un clic entre
   *Copla* (herramientas completas), *Explorador* (solo lectura),
   *Cartógrafo* (simbología, etiquetas, mapas y layouts), *Editor*
@@ -221,9 +227,10 @@ no necesita un cliente IA externo:
   (`copla_chat.json`) y la conversación en `copla_chat_history.json`;
   la clave nunca sale de tu equipo.
 
-Uso: pestaña *Chat* → *Configuración* → elegir proveedor, pegar la API
-key, *Guardar*, y escribir algo como *“descargá los países de
-world.geo.json y pintalos por continente”*.
+Uso: pestaña *Chat* → escribir y Enter — ya funciona sin configurar
+nada. Para cambiar de proveedor: el pill del proveedor (⚙), elegir el
+preset y pegar la key si lo pide. Por ejemplo: *“descargá los países
+de world.geo.json y pintalos por continente”*.
 
 ## Herramientas (37, tipadas)
 

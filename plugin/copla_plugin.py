@@ -18,6 +18,7 @@ from qgis.PyQt.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDockWidget,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -27,17 +28,125 @@ from qgis.PyQt.QtWidgets import (
     QPushButton,
     QTabWidget,
     QTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 from qgis.PyQt.QtGui import QFontDatabase, QGuiApplication, QIcon
 
-from .chat import AGENTS, DEFAULT_SYSTEM_PROMPT, PRESETS, ChatEngine, save_config
+from .chat import (
+    AGENTS,
+    DEFAULT_SYSTEM_PROMPT,
+    PRESETS,
+    ChatEngine,
+    _args_summary,
+    _safe_json,
+    save_config,
+)
 from .discovery import TOKEN_NAME, remove_config, write_config
 from .http_server import CoplaHttpServer
 from .tools import PLUGIN_VERSION, run_tool, tools_manifest
 
 DEFAULT_PORT = 8970
+
+CHAT_SUGGESTIONS = [
+    "Listá mis capas",
+    "Shape de Uruguay",
+    "Estilo por columna",
+]
+
+CHAT_QSS = """
+    QTextEdit#chatView {
+        border: 1px solid #d7dbe0;
+        border-radius: 8px;
+        padding: 6px;
+        font-size: 13px;
+        background: #ffffff;
+    }
+    QFrame#inputCard {
+        border: 1px solid #c9ced6;
+        border-radius: 10px;
+        background: #ffffff;
+    }
+    QTextEdit#chatInput {
+        border: none;
+        background: transparent;
+        font-size: 13px;
+        padding: 2px;
+    }
+    QPushButton#sendBtn {
+        background-color: #1a73e8;
+        color: #ffffff;
+        border: none;
+        border-radius: 15px;
+        min-width: 30px;
+        max-width: 30px;
+        min-height: 30px;
+        max-height: 30px;
+        font-size: 15px;
+        font-weight: bold;
+    }
+    QPushButton#sendBtn:disabled {
+        background-color: #c4c9cf;
+    }
+    QPushButton#stopBtn {
+        color: #d93025;
+        background: #ffffff;
+        border: 1px solid #d93025;
+        border-radius: 15px;
+        min-width: 30px;
+        max-width: 30px;
+        min-height: 30px;
+        max-height: 30px;
+        font-size: 13px;
+    }
+    QPushButton#gearBtn {
+        border: none;
+        background: transparent;
+        font-size: 15px;
+        padding: 2px 6px;
+    }
+    QPushButton#gearBtn:checked {
+        background: #e8eaed;
+        border-radius: 6px;
+    }
+    QPushButton#gearBtn:hover {
+        background: #f1f3f4;
+    }
+    QComboBox#pill {
+        border: 1px solid #d0d5db;
+        border-radius: 6px;
+        padding: 2px 6px;
+        background: #f6f8fa;
+        font-size: 12px;
+        min-height: 20px;
+    }
+    QComboBox#pill:hover {
+        border-color: #1a73e8;
+    }
+    QToolButton#sugBtn {
+        border: 1px solid #d0d5db;
+        border-radius: 10px;
+        padding: 3px 10px;
+        background: #f6f8fa;
+        font-size: 12px;
+        color: #3c4043;
+    }
+    QToolButton#sugBtn:hover {
+        border-color: #1a73e8;
+        color: #1a73e8;
+    }
+    QPushButton#newBtn {
+        border: 1px solid #d0d5db;
+        border-radius: 6px;
+        padding: 2px 8px;
+        font-size: 11px;
+        background: #ffffff;
+    }
+    QPushButton#newBtn:hover {
+        border-color: #1a73e8;
+    }
+"""
 
 GIT_DEP = "git+https://github.com/pepehalfonso/copla-plugin#subdirectory=mcp_server"
 
@@ -497,14 +606,21 @@ class CoplaPlugin:
         outer = QVBoxLayout(tab)
         outer.setContentsMargins(8, 8, 8, 8)
         outer.setSpacing(6)
+        tab.setStyleSheet(CHAT_QSS)
 
-        self.cfg_toggle = QPushButton("Configuración ▸")
-        self.cfg_toggle.setCheckable(True)
-        self.cfg_toggle.setStyleSheet("text-align:left; padding:2px;")
-        self.cfg_toggle.toggled.connect(self._chat_toggle_cfg)
-        outer.addWidget(self.cfg_toggle)
+        header = QHBoxLayout()
+        header.addStretch(1)
+        self.chat_status = QLabel("Listo")
+        self.chat_status.setStyleSheet("color:#5f6368; font-size:11px;")
+        header.addWidget(self.chat_status)
+        self.chat_new_btn = QPushButton("↻ Nueva")
+        self.chat_new_btn.setObjectName("newBtn")
+        self.chat_new_btn.setToolTip("Nueva conversación")
+        self.chat_new_btn.clicked.connect(self._chat_new)
+        header.addWidget(self.chat_new_btn)
+        outer.addLayout(header)
 
-        self.cfg_group = QGroupBox("Proveedor del chat")
+        self.cfg_group = QGroupBox("Configuración del chat")
         cfg = QGridLayout(self.cfg_group)
         cfg.setSpacing(6)
         cfg.addWidget(QLabel("Proveedor:"), 0, 0)
@@ -550,60 +666,98 @@ class CoplaPlugin:
         self.cfg_url.setText(self.chat.config.get("base_url", ""))
         self.cfg_model.setText(self.chat.config.get("model", ""))
         self.cfg_key.setText(self.chat.config.get("api_key", ""))
-        self._chat_match_preset()
-        configured = bool(self.chat.config.get("model"))
-        self.cfg_group.setVisible(not configured)
-        self.cfg_toggle.setChecked(not configured)
 
         self.chat_view = QTextEdit()
+        self.chat_view.setObjectName("chatView")
         self.chat_view.setReadOnly(True)
         self.chat_view.setMinimumHeight(150)
         outer.addWidget(self.chat_view, 1)
 
-        agent_row = QHBoxLayout()
-        agent_row.setSpacing(6)
-        agent_row.addWidget(QLabel("Agente:"))
+        self.suggestions = QWidget()
+        sug_l = QHBoxLayout(self.suggestions)
+        sug_l.setContentsMargins(0, 0, 0, 0)
+        sug_l.setSpacing(6)
+        self.suggestion_btns = []
+        for sug in CHAT_SUGGESTIONS:
+            sug_btn = QToolButton()
+            sug_btn.setObjectName("sugBtn")
+            sug_btn.setText(sug)
+            sug_btn.clicked.connect(lambda _=False, t=sug: self._chat_suggestion(t))
+            sug_l.addWidget(sug_btn)
+            self.suggestion_btns.append(sug_btn)
+        sug_l.addStretch(1)
+        outer.addWidget(self.suggestions)
+
+        card = QFrame()
+        card.setObjectName("inputCard")
+        card_l = QVBoxLayout(card)
+        card_l.setContentsMargins(10, 6, 10, 6)
+        card_l.setSpacing(4)
+        self.chat_input = _ChatInput()
+        self.chat_input.setObjectName("chatInput")
+        self.chat_input.setPlaceholderText(
+            "Preguntá lo que quieras… (Enter envía, Shift+Enter nueva línea)"
+        )
+        self.chat_input.setFixedHeight(56)
+        self.chat_input.submitted.connect(self._chat_send)
+        card_l.addWidget(self.chat_input)
+
+        foot = QHBoxLayout()
+        foot.setSpacing(6)
+        self.cfg_toggle = QPushButton("⚙")
+        self.cfg_toggle.setObjectName("gearBtn")
+        self.cfg_toggle.setCheckable(True)
+        self.cfg_toggle.setToolTip("Configuración del chat (proveedor, API key, prompt)")
+        self.cfg_toggle.toggled.connect(self._chat_toggle_cfg)
+        foot.addWidget(self.cfg_toggle)
+
         self.chat_agent = QComboBox()
+        self.chat_agent.setObjectName("pill")
         for agent_name in AGENTS:
             self.chat_agent.addItem(agent_name)
-        self.chat_agent.setMinimumWidth(160)
         saved_agent = self.chat.config.get("agent") or "Copla"
         saved_idx = self.chat_agent.findText(saved_agent)
         self.chat_agent.setCurrentIndex(saved_idx if saved_idx >= 0 else 0)
-        agent_row.addWidget(self.chat_agent)
-        self.agent_desc = QLabel(
+        self.chat_agent.setToolTip(
             AGENTS[self.chat_agent.currentText()]["description"]
         )
-        self.agent_desc.setStyleSheet("color:#5f6368; font-size:11px;")
-        self.agent_desc.setWordWrap(True)
-        agent_row.addWidget(self.agent_desc, 1)
         self.chat_agent.currentTextChanged.connect(self._chat_agent_changed)
-        outer.addLayout(agent_row)
+        foot.addWidget(self.chat_agent)
 
-        self.chat_input = _ChatInput()
-        self.chat_input.setPlaceholderText(
-            "Escribí tu pedido… (Enter envía, Shift+Enter nueva línea)"
-        )
-        self.chat_input.setFixedHeight(54)
-        self.chat_input.submitted.connect(self._chat_send)
-        outer.addWidget(self.chat_input)
+        self.chat_model = QComboBox()
+        self.chat_model.setObjectName("pill")
+        for label in PRESETS:
+            self.chat_model.addItem(label)
+        self.chat_model.setToolTip("Proveedor y modelo (click para cambiar)")
+        self.chat_model.currentTextChanged.connect(self._chat_model_changed)
+        foot.addWidget(self.chat_model)
 
-        row = QHBoxLayout()
-        self.chat_send_btn = QPushButton("Enviar")
-        self.chat_send_btn.clicked.connect(self._chat_send)
-        self.chat_stop_btn = QPushButton("Detener")
+        foot.addStretch(1)
+        self.chat_stop_btn = QPushButton("■")
+        self.chat_stop_btn.setObjectName("stopBtn")
+        self.chat_stop_btn.setToolTip("Detener respuesta")
         self.chat_stop_btn.clicked.connect(self._chat_stop)
         self.chat_stop_btn.setEnabled(False)
-        new_btn = QPushButton("Nueva conversación")
-        new_btn.clicked.connect(self._chat_new)
-        self.chat_status = QLabel("Listo")
-        self.chat_status.setStyleSheet("color:#5f6368; font-size:11px;")
-        row.addWidget(self.chat_send_btn)
-        row.addWidget(self.chat_stop_btn)
-        row.addWidget(new_btn)
-        row.addStretch(1)
-        row.addWidget(self.chat_status)
-        outer.addLayout(row)
+        self.chat_stop_btn.hide()
+        foot.addWidget(self.chat_stop_btn)
+        self.chat_send_btn = QPushButton("↑")
+        self.chat_send_btn.setObjectName("sendBtn")
+        self.chat_send_btn.setToolTip("Enviar (Enter)")
+        self.chat_send_btn.clicked.connect(self._chat_send)
+        foot.addWidget(self.chat_send_btn)
+        card_l.addLayout(foot)
+        outer.addWidget(card)
+
+        self.agent_desc = QLabel(tab)
+        self.agent_desc.setText(
+            AGENTS[self.chat_agent.currentText()]["description"]
+        )
+        self.agent_desc.hide()
+
+        self._chat_match_preset()
+        configured = bool(self.chat.config.get("model"))
+        self.cfg_group.setVisible(not configured)
+        self.cfg_toggle.setChecked(not configured)
 
         self._stream_open = False
         self._render_chat_history()
@@ -620,10 +774,13 @@ class CoplaPlugin:
         ):
             self.cfg_group.setVisible(True)
             self.cfg_toggle.setChecked(True)
+            self.cfg_key.setFocus()
             self.chat_status.setText("Configurá proveedor y modelo")
             return
         if not self.chat.messages:
             self.chat_view.clear()
+            if hasattr(self, "suggestions"):
+                self.suggestions.setVisible(False)
         self.chat_input.clear()
         self._chat_close_stream()
         self._chat_break(double=True)
@@ -644,8 +801,14 @@ class CoplaPlugin:
             return
         self.chat.config["agent"] = name
         save_config(self.chat.config)
-        self.agent_desc.setText(AGENTS[name]["description"])
+        desc = AGENTS[name]["description"]
+        self.agent_desc.setText(desc)
+        self.chat_agent.setToolTip(desc)
         self.chat_status.setText("Agente: %s" % name)
+
+    def _chat_suggestion(self, text):
+        self.chat_input.setPlainText(text)
+        self.chat_input.setFocus()
 
     def _chat_new(self):
         if self.chat is None or self.chat.busy:
@@ -656,19 +819,48 @@ class CoplaPlugin:
 
     def _chat_toggle_cfg(self, checked):
         self.cfg_group.setVisible(checked)
-        self.cfg_toggle.setText(
-            "Configuración ▾" if checked else "Configuración ▸"
-        )
 
-    def _chat_preset_changed(self, label):
-        if self._cfg_loading:
-            return
+    def _apply_preset(self, label):
         preset = PRESETS.get(label)
         self.cfg_hint.setText(preset.get("hint", "") if preset else "")
+        self.cfg_key.setText(preset.get("api_key", "") if preset else "")
         if preset and preset.get("base_url"):
             self.cfg_url.setText(preset["base_url"])
             if preset.get("model"):
                 self.cfg_model.setText(preset["model"])
+
+    def _commit_preset(self, label):
+        self.chat.config["base_url"] = self.cfg_url.text().strip()
+        self.chat.config["api_key"] = self.cfg_key.text().strip()
+        self.chat.config["model"] = self.cfg_model.text().strip()
+        save_config(self.chat.config)
+        self.chat_status.setText("Proveedor: %s" % label)
+
+    def _chat_preset_changed(self, label):
+        if self._cfg_loading:
+            return
+        self._cfg_loading = True
+        try:
+            self._apply_preset(label)
+            idx = self.chat_model.findText(label)
+            if idx >= 0 and self.chat_model.currentIndex() != idx:
+                self.chat_model.setCurrentIndex(idx)
+        finally:
+            self._cfg_loading = False
+        self._commit_preset(label)
+
+    def _chat_model_changed(self, label):
+        if self._cfg_loading:
+            return
+        self._cfg_loading = True
+        try:
+            self._apply_preset(label)
+            idx = self.cfg_preset.findText(label)
+            if idx >= 0 and self.cfg_preset.currentIndex() != idx:
+                self.cfg_preset.setCurrentIndex(idx)
+        finally:
+            self._cfg_loading = False
+        self._commit_preset(label)
 
     def _chat_match_preset(self):
         self._cfg_loading = True
@@ -684,9 +876,10 @@ class CoplaPlugin:
                 ):
                     matched = label
                     break
-            idx = self.cfg_preset.findText(matched)
-            if idx >= 0:
-                self.cfg_preset.setCurrentIndex(idx)
+            for combo in (self.cfg_preset, self.chat_model):
+                idx = combo.findText(matched)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
             preset = PRESETS.get(matched)
             self.cfg_hint.setText(preset.get("hint", "") if preset else "")
         finally:
@@ -744,6 +937,8 @@ class CoplaPlugin:
     def _on_chat_busy(self, busy):
         self.chat_send_btn.setEnabled(not busy)
         self.chat_stop_btn.setEnabled(busy)
+        self.chat_send_btn.setVisible(not busy)
+        self.chat_stop_btn.setVisible(busy)
         if busy:
             self.chat_status.setText("Pensando…")
 
@@ -784,19 +979,45 @@ class CoplaPlugin:
     def _render_chat_history(self):
         self._stream_open = False
         messages = self.chat.messages if self.chat is not None else []
+        has_msgs = bool(messages)
+        if hasattr(self, "suggestions"):
+            self.suggestions.setVisible(not has_msgs)
         if not messages:
             self.chat_view.setHtml(
-                "<span style='color:#666; font-size:12px'>Configurá el "
-                "proveedor (si hace falta) y escribí para empezar. La IA usa "
-                "las herramientas de Copla para trabajar con capas, estilos "
-                "y archivos de QGIS.</span>"
+                "<div align='center'><br>"
+                "<span style='color:#3c4043; font-size:13px'>"
+                "<b>Empezá a pedirle a Copla</b></span><br><br>"
+                "<span style='color:#666; font-size:12px'>"
+                "Elegí el agente y el proveedor con los botones de abajo, "
+                "y escribí tu pedido. La IA usa las herramientas de Copla "
+                "para trabajar con capas, estilos y archivos de QGIS."
+                "</span></div>"
             )
             return
         self.chat_view.clear()
+        pending = {}
         for msg in messages:
             role = msg.get("role")
             content = msg.get("content")
-            if not content:
+            if role == "assistant":
+                for tc in msg.get("tool_calls") or []:
+                    fn = tc.get("function") or {}
+                    pending[tc.get("id") or ""] = _safe_json(fn.get("arguments") or "{}")
+                if not content:
+                    continue
+            elif role == "tool":
+                args = pending.get(msg.get("tool_call_id") or "")
+                summary = _args_summary(msg.get("name") or "", args)
+                bad = str(content or "").startswith("ERROR[")
+                self._chat_break()
+                self._chat_append_html(
+                    "<span style='color:%s; font-family:Consolas,monospace; "
+                    "font-size:11px'>&#9656; %s — %s</span>"
+                    % ("#b42318" if bad else "#5f6368", html.escape(summary),
+                       "error" if bad else "ok")
+                )
+                continue
+            elif not content:
                 continue
             self._chat_break(double=True)
             if role == "user":

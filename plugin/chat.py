@@ -18,11 +18,18 @@ from qgis.PyQt.QtNetwork import QNetworkReply, QNetworkRequest
 from .tools import TOOLS, ToolError, run_tool
 
 PRESETS = {
+    "Gratis (sin API key)": {
+        "base_url": "https://text.pollinations.ai/openai",
+        "model": "openai",
+        "hint": "Cero configuración: sin registro ni key, sale funcionando. "
+                "Servicio comunitario con límites de uso; si necesitás más, "
+                "cambiá de proveedor con este mismo menú.",
+    },
     "MiMo v2.5 Free (Zen)": {
         "base_url": "https://opencode.ai/zen/v1",
         "model": "mimo-v2.5-free",
-        "hint": "Key gratis en opencode.ai/auth (modelos Free $0, sin tarjeta). "
-                "Otros modelos free de licencia MIT: deepseek-v4-flash-free, glm-4.7-free.",
+        "hint": "Requiere tu propia API key de opencode.ai (el free tier de "
+                "Zen solo opera desde la app de opencode, no desde acá).",
     },
     "OpenRouter (free)": {
         "base_url": "https://openrouter.ai/api/v1",
@@ -174,9 +181,9 @@ def _history_path():
 
 def load_config():
     config = {
-        "base_url": "",
+        "base_url": "https://text.pollinations.ai/openai",
         "api_key": "",
-        "model": "",
+        "model": "openai",
         "system_prompt": DEFAULT_SYSTEM_PROMPT,
         "agent": "Copla",
     }
