@@ -50,20 +50,20 @@ uvx --from "git+https://github.com/pepehalfonso/copla-plugin#subdirectory=mcp_se
 }
 ```
 
-## Tools (37)
+## Tools (63)
 
 | Group | Tools |
 |---|---|
 | Health | `diagnose`, `list_qgis_tools` |
 | Project | `get_project_info`, `load_project`, `save_project`, `set_project_crs` |
-| Layers | `list_layers`, `get_layer_info`, `add_layer`, `create_layer`, `download_layer`, `http_get`, `save_layer_as`, `add_basemap`, `remove_layer`, `rename_layer`, `set_layer_visibility`, `zoom_to_layer` |
-| Features | `get_features`, `select_features`, `run_expression` |
-| Editing | `add_features`, `update_attributes`, `delete_features` |
-| Style | `set_renderer`, `set_labels` |
-| View & selection | `set_extent`, `clear_selection`, `zoom_to_selection` |
-| Files | `list_directory`, `move_file` |
-| Processing | `search_algorithms`, `get_algorithm_info`, `run_algorithm` |
-| Output | `render_map`, `list_layouts`, `export_layout` |
+| Layers | `list_layers`, `get_layer_info`, `add_layer`, `create_layer`, `download_layer`, `http_get`, `http_post`, `save_layer_as`, `add_basemap`, `remove_layer`, `remove_group`, `rename_layer`, `set_layer_visibility`, `zoom_to_layer`, `create_group`, `rename_group`, `move_layer` |
+| Features | `get_features`, `select_features`, `run_expression`, `unique_values` |
+| Editing | `add_features`, `update_attributes`, `delete_features`, `add_field`, `remove_field`, `rename_field`, `calculate_field` |
+| Style | `set_renderer`, `set_labels`, `save_style`, `load_style`, `copy_style` |
+| View & selection | `set_extent`, `clear_selection`, `zoom_to_selection`, `select_by_location`, `zoom_to_project` |
+| Files | `list_directory`, `move_file`, `read_file`, `file_info`, `copy_file`, `delete_file`, `download_file` |
+| Processing | `search_algorithms`, `get_algorithm_info`, `run_algorithm`, `buffer`, `reproject_layer`, `clip`, `intersection`, `dissolve`, `fix_geometries` |
+| Output | `render_map`, `list_layouts`, `export_layout`, `create_layout` |
 
 There is deliberately **no `execute_python` tool**. Every operation is a
 validated, reviewed function inside the plugin.

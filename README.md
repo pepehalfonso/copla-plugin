@@ -31,13 +31,15 @@ PyQGIS: capas, features, Processing, layouts, renders
 
 ![Chat embebido](docs/screenshots/shot-chat.png)
 
+![Chat embebido — respuesta y mapa renderizado](docs/screenshots/shot-chat-reply.png)
+
 ![Chat embebido — estado inicial](docs/screenshots/shot-chat-empty.png)
 
 ## Qué hace
 
-- **37 herramientas tipadas**: capas, features, edición de datos,
-  simbología, descarga de datos de internet, gestión de archivos,
-  algoritmos de Processing, renders, layouts y proyectos —
+- **63 herramientas tipadas**: capas, features, edición de datos y campos,
+  simbología, selección espacial, descarga de datos de internet, gestión de
+  archivos, algoritmos de Processing, renders, layouts y proyectos —
   todo con parámetros validados.
 - **Sin `execute_python`.** La IA solo puede llamar a operaciones revisadas
   dentro del complemento; no existe endpoint de código arbitrario.
@@ -45,8 +47,10 @@ PyQGIS: capas, features, Processing, layouts, renders
   snippet de configuración exacto para tu cliente IA (copiar y pegar).
 - **Chat embebido**: pestaña *Chat* en el mismo panel — **sale
   funcionando sin API key** (preset *Gratis*), con streaming,
-  tool-calling sobre las herramientas del complemento, selector de
-  agentes e historial persistente, sin cliente IA externo.
+  tool-calling sobre las herramientas del complemento, burbujas de
+  conversación, chips de herramientas clickeables, mapa embebido en
+  la respuesta, selector de agentes e historial persistente, sin
+  cliente IA externo.
 - **Auto-descubrimiento**: el lado MCP encuentra QGIS solo, leyendo
   `copla.json` de tu perfil. No hay puertos ni tokens que configurar a mano.
 - **Seguro por defecto**: solo `127.0.0.1`, token aleatorio obligatorio,
@@ -217,7 +221,13 @@ no necesita un cliente IA externo:
   selección se guarda sola y el historial es compartido.
 - **Streaming** en tiempo real con **tool-calling** sobre el mismo
   registro de herramientas tipadas del complemento (máx. 8 pasos por
-  turno, sin ejecución de código arbitrario).
+  turno, sin ejecución de código arbitrario). Si el proveedor falla
+  con streaming, se reintenta **automáticamente sin streaming**.
+- **Interfaz de chat moderna**: burbujas (vos a la derecha, Copla a
+  la izquierda); cada llamada a una herramienta aparece como chip
+  **clickeable** que abre el resultado completo; y si el agente
+  renderiza un mapa o layout, la imagen se muestra **dentro de la
+  respuesta**. Los chips de sugerencia envían la consulta con un clic.
 - **Historial persistente** entre sesiones y **prompt de sistema
   editable**.
 - Puede **descargar capas de internet**, gestionar archivos locales,
@@ -232,20 +242,20 @@ nada. Para cambiar de proveedor: el pill del proveedor (⚙), elegir el
 preset y pegar la key si lo pide. Por ejemplo: *“descargá los países
 de world.geo.json y pintalos por continente”*.
 
-## Herramientas (37, tipadas)
+## Herramientas (63, tipadas)
 
 | Grupo | Herramientas |
 |---|---|
 | Salud | `diagnose`, `list_qgis_tools` |
 | Proyecto | `get_project_info`, `load_project`, `save_project`, `set_project_crs` |
-| Capas | `list_layers`, `get_layer_info`, `add_layer`, `create_layer`, `download_layer`, `http_get`, `save_layer_as`, `add_basemap`, `remove_layer`, `rename_layer`, `set_layer_visibility`, `zoom_to_layer` |
-| Features | `get_features`, `select_features`, `run_expression` |
-| Edición | `add_features`, `update_attributes`, `delete_features` |
-| Estilo | `set_renderer`, `set_labels` |
-| Vista y selección | `set_extent`, `clear_selection`, `zoom_to_selection` |
-| Archivos | `list_directory`, `move_file` |
-| Processing | `search_algorithms`, `get_algorithm_info`, `run_algorithm` |
-| Salida | `render_map`, `list_layouts`, `export_layout` |
+| Capas | `list_layers`, `get_layer_info`, `add_layer`, `create_layer`, `download_layer`, `http_get`, `http_post`, `save_layer_as`, `add_basemap`, `remove_layer`, `remove_group`, `rename_layer`, `set_layer_visibility`, `zoom_to_layer`, `create_group`, `rename_group`, `move_layer` |
+| Features | `get_features`, `select_features`, `run_expression`, `unique_values` |
+| Edición | `add_features`, `update_attributes`, `delete_features`, `add_field`, `remove_field`, `rename_field`, `calculate_field` |
+| Estilo | `set_renderer`, `set_labels`, `save_style`, `load_style`, `copy_style` |
+| Vista y selección | `set_extent`, `clear_selection`, `zoom_to_selection`, `select_by_location`, `zoom_to_project` |
+| Archivos | `list_directory`, `move_file`, `read_file`, `file_info`, `copy_file`, `delete_file`, `download_file` |
+| Processing | `search_algorithms`, `get_algorithm_info`, `run_algorithm`, `buffer`, `reproject_layer`, `clip`, `intersection`, `dissolve`, `fix_geometries` |
+| Salida | `render_map`, `list_layouts`, `export_layout`, `create_layout` |
 
 ## Seguridad
 

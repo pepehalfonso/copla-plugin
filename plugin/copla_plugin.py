@@ -8,6 +8,7 @@ have to hand-write configuration.
 import html
 import json
 import os
+import re
 import secrets
 
 from qgis.core import Qgis, QgsApplication
@@ -24,6 +25,7 @@ from qgis.PyQt.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QTabWidget,
@@ -32,7 +34,16 @@ from qgis.PyQt.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from qgis.PyQt.QtGui import QFontDatabase, QGuiApplication, QIcon
+from qgis.PyQt.QtGui import (
+    QColor,
+    QFontDatabase,
+    QGuiApplication,
+    QIcon,
+    QTextCharFormat,
+    QTextCursor,
+    QTextLength,
+    QTextTableFormat,
+)
 
 from .chat import (
     AGENTS,
@@ -61,7 +72,7 @@ CHAT_QSS = """
         border-radius: 8px;
         padding: 6px;
         font-size: 13px;
-        background: #ffffff;
+        background: #f6f8fa;
     }
     QFrame#inputCard {
         border: 1px solid #c9ced6;
@@ -253,6 +264,8 @@ class CoplaPlugin:
         self._tabify_attempted = False
         self.chat = None
         self._stream_open = False
+        self._bubble = None
+        self._tool_results = []
         self._cfg_loading = False
         self._chat_was_at_end = True
 
@@ -667,10 +680,11 @@ class CoplaPlugin:
         self.cfg_model.setText(self.chat.config.get("model", ""))
         self.cfg_key.setText(self.chat.config.get("api_key", ""))
 
-        self.chat_view = QTextEdit()
+        self.chat_view = _ChatView()
         self.chat_view.setObjectName("chatView")
         self.chat_view.setReadOnly(True)
         self.chat_view.setMinimumHeight(150)
+        self.chat_view.anchor_clicked.connect(self._on_chat_anchor)
         outer.addWidget(self.chat_view, 1)
 
         self.suggestions = QWidget()
@@ -760,6 +774,8 @@ class CoplaPlugin:
         self.cfg_toggle.setChecked(not configured)
 
         self._stream_open = False
+        self._bubble = None
+        self._tool_results = []
         self._render_chat_history()
         return tab
 
@@ -779,16 +795,16 @@ class CoplaPlugin:
             return
         if not self.chat.messages:
             self.chat_view.clear()
+            self._bubble = None
+            self._tool_results = []
             if hasattr(self, "suggestions"):
                 self.suggestions.setVisible(False)
         self.chat_input.clear()
         self._chat_close_stream()
         self._chat_break(double=True)
-        self._chat_append_html(
-            "<span style='color:#1a7f37; font-size:12px'><b>Vos:</b> "
-        )
+        self._bubble_open("user")
         self._chat_append_plain(text)
-        self._chat_append_html("</span>")
+        self._close_bubble()
         self.chat.send(text)
 
     def _chat_stop(self):
@@ -807,8 +823,10 @@ class CoplaPlugin:
         self.chat_status.setText("Agente: %s" % name)
 
     def _chat_suggestion(self, text):
+        if self.chat is None or self.chat.busy:
+            return
         self.chat_input.setPlainText(text)
-        self.chat_input.setFocus()
+        self._chat_send()
 
     def _chat_new(self):
         if self.chat is None or self.chat.busy:
@@ -903,35 +921,69 @@ class CoplaPlugin:
     def _on_chat_token(self, text):
         if not self._stream_open:
             self._chat_break(double=True)
-            self._chat_append_html(
-                "<span style='font-size:12px'><b>Copla:</b> "
-            )
+            self._bubble_open("ai")
             self._stream_open = True
         self._chat_append_plain(text)
 
     def _on_chat_tool_event(self, name, summary, status):
         self._chat_close_stream()
-        color = "#5f6368" if status == "ok" else "#b42318"
-        label = "ok" if status == "ok" else "error"
+        self._close_bubble()
+        result = ""
+        if self.chat is not None and self.chat.messages:
+            last = self.chat.messages[-1]
+            if last.get("role") == "tool":
+                result = str(last.get("content") or "")
         self._chat_break()
-        self._chat_append_html(
-            "<span style='color:%s; font-family:Consolas,monospace; "
-            "font-size:11px'>&#9656; %s — %s</span>"
-            % (color, html.escape(str(summary)), label)
-        )
+        self._tool_chip(summary, status, result)
+        img = self._tool_image_path(name, result)
+        if img:
+            self._chat_break()
+            self._bubble_open("ai")
+            self._chat_append_html("<img src='%s' width='300'>" % img)
+            self._close_bubble()
         self.chat_status.setText("Ejecutando %s…" % name)
 
     def _on_chat_finished(self, text):
+        if self._stream_open and text and "*" in text and getattr(
+            self, "_bubble_table", None
+        ):
+            if self._clear_bubble_content():
+                self._chat_append_html(self._md_to_html(text))
         self._chat_close_stream()
         self.chat_status.setText("Listo")
 
+    def _clear_bubble_content(self):
+        table = getattr(self, "_bubble_table", None)
+        if table is None:
+            return False
+        cell = table.cellAt(0, 0)
+        cursor = QTextCursor(cell.firstCursorPosition())
+        cursor.setPosition(
+            cell.lastCursorPosition().position(), QTextCursor.KeepAnchor
+        )
+        cursor.removeSelectedText()
+        self._bubble_cursor = QTextCursor(cursor)
+        return True
+
+    def _md_to_html(self, text):
+        esc = html.escape(str(text))
+        esc = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", esc)
+        esc = re.sub(
+            r"`(.+?)`",
+            r"<span style='font-family:Consolas,monospace'>\1</span>",
+            esc,
+        )
+        esc = re.sub(r"(?<!\*)\*([^*]+?)\*(?!\*)", r"<i>\1</i>", esc)
+        esc = esc.replace("\n", "<br>")
+        return esc
+
     def _on_chat_error(self, message):
         self._chat_close_stream()
+        self._close_bubble()
         self._chat_break(double=True)
-        self._chat_append_html(
-            "<span style='color:#b42318; font-size:12px'>"
-            "<b>Error:</b> %s</span>" % html.escape(str(message))
-        )
+        self._bubble_open("err")
+        self._chat_append_plain(str(message))
+        self._close_bubble()
         self.chat_status.setText("Error")
 
     def _on_chat_busy(self, busy):
@@ -953,31 +1005,132 @@ class CoplaPlugin:
 
     def _chat_append_html(self, text):
         self._chat_was_at_end = self._chat_at_end()
-        cursor = self.chat_view.textCursor()
-        cursor.movePosition(cursor.End)
-        self.chat_view.setTextCursor(cursor)
-        self.chat_view.insertHtml(text)
+        if self._bubble:
+            self._bubble_cursor.insertHtml(text)
+        else:
+            cursor = self.chat_view.textCursor()
+            cursor.movePosition(cursor.End)
+            self.chat_view.setTextCursor(cursor)
+            self.chat_view.insertHtml(text)
         self._chat_scroll()
 
     def _chat_append_plain(self, text):
         self._chat_was_at_end = self._chat_at_end()
-        cursor = self.chat_view.textCursor()
-        cursor.movePosition(cursor.End)
-        self.chat_view.setTextCursor(cursor)
-        self.chat_view.insertPlainText(text)
+        if self._bubble:
+            self._bubble_cursor.insertText(text, self._bubble_fmt)
+        else:
+            cursor = self.chat_view.textCursor()
+            cursor.movePosition(cursor.End)
+            self.chat_view.setTextCursor(cursor)
+            self.chat_view.insertPlainText(text)
         self._chat_scroll()
 
     def _chat_close_stream(self):
-        if self._stream_open:
-            self._stream_open = False
-            self._chat_append_html("</span>")
+        self._stream_open = False
+        self._close_bubble()
 
     def _chat_break(self, double=False):
         if self.chat_view.document().characterCount() > 1:
             self._chat_append_html("<br>" + ("<br>" if double else ""))
 
+    def _bubble_open(self, role):
+        if self._bubble == role:
+            return
+        self._close_bubble()
+        if role == "user":
+            align, bg, border, color = Qt.AlignRight, "#e6f4ea", "#a8d5b5", "#137333"
+        elif role == "err":
+            align, bg, border, color = Qt.AlignLeft, "#fce8e6", "#f28b82", "#b3261e"
+        else:
+            align, bg, border, color = Qt.AlignLeft, "#ffffff", "#d7dbe0", "#202124"
+        cursor = self.chat_view.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        self.chat_view.setTextCursor(cursor)
+        outer_fmt = QTextTableFormat()
+        outer_fmt.setWidth(QTextLength(QTextLength.PercentageLength, 100))
+        outer_fmt.setCellSpacing(0)
+        outer_fmt.setBorderStyle(QTextTableFormat.BorderStyle_None)
+        cursor.insertTable(1, 1, outer_fmt)
+        inner_fmt = QTextTableFormat()
+        inner_fmt.setBorder(1)
+        inner_fmt.setBorderStyle(QTextTableFormat.BorderStyle_Solid)
+        inner_fmt.setBorderBrush(QColor(border))
+        inner_fmt.setPadding(6)
+        inner_fmt.setCellSpacing(0)
+        inner_fmt.setBackground(QColor(bg))
+        inner_fmt.setAlignment(align)
+        inner = cursor.insertTable(1, 1, inner_fmt)
+        self._bubble_table = inner
+        self._bubble_cursor = QTextCursor(cursor)
+        char_fmt = QTextCharFormat()
+        char_fmt.setForeground(QColor(color))
+        char_fmt.setFontPointSize(13)
+        self._bubble_fmt = char_fmt
+        self.chat_view.setTextCursor(self._bubble_cursor)
+        self._bubble = role
+
+    def _close_bubble(self):
+        if getattr(self, "_bubble", None):
+            self._bubble = None
+            self._bubble_cursor = None
+            self._bubble_table = None
+            cursor = self.chat_view.textCursor()
+            cursor.movePosition(QTextCursor.End)
+            self.chat_view.setTextCursor(cursor)
+
+    def _tool_chip(self, summary, status, result=""):
+        idx = len(self._tool_results)
+        self._tool_results.append(result)
+        ok = status == "ok"
+        color = "#3c4043" if ok else "#b42318"
+        label = "ok" if ok else "error"
+        self._chat_append_html(
+            "<table width='100%%' cellspacing='0' cellpadding='0'><tr><td>"
+            "<table cellspacing='0' cellpadding='3' border='1' bordercolor='#d0d5db' "
+            "style='background:#eef1f4'><tr><td>"
+            "<a href='copla-tool:%d' style='color:%s; text-decoration:none; "
+            "font-family:Consolas,monospace; font-size:11px'>"
+            "&#9656; %s — %s</a>"
+            "</td></tr></table></td></tr></table>"
+            % (idx, color, html.escape(str(summary)), label)
+        )
+
+    def _tool_image_path(self, name, result):
+        if name not in ("render_map", "export_layout"):
+            return None
+        try:
+            data = json.loads(result)
+        except ValueError:
+            return None
+        if not isinstance(data, dict):
+            return None
+        path = str(data.get("saved") or data.get("file") or "")
+        if not path.lower().endswith((".png", ".jpg", ".jpeg")):
+            return None
+        path = path.replace("\\", "/")
+        return path if os.path.exists(path) else None
+
+    def _on_chat_anchor(self, raw):
+        raw = str(raw)
+        if not raw.startswith("copla-tool:"):
+            return
+        try:
+            idx = int(raw.split(":", 1)[1])
+            result = self._tool_results[idx]
+        except (ValueError, IndexError):
+            return
+        mb = QMessageBox(self.chat_view)
+        mb.setWindowTitle("Resultado de la herramienta")
+        mb.setTextFormat(Qt.PlainText)
+        text = str(result or "(sin salida)")
+        mb.setText(text if len(text) <= 900 else text[:900] + "…")
+        mb.setDetailedText(text)
+        mb.exec_()
+
     def _render_chat_history(self):
         self._stream_open = False
+        self._bubble = None
+        self._tool_results = []
         messages = self.chat.messages if self.chat is not None else []
         has_msgs = bool(messages)
         if hasattr(self, "suggestions"):
@@ -995,6 +1148,8 @@ class CoplaPlugin:
             )
             return
         self.chat_view.clear()
+        self._bubble = None
+        self._tool_results = []
         pending = {}
         for msg in messages:
             role = msg.get("role")
@@ -1005,32 +1160,52 @@ class CoplaPlugin:
                     pending[tc.get("id") or ""] = _safe_json(fn.get("arguments") or "{}")
                 if not content:
                     continue
+                self._close_bubble()
+                self._chat_break(double=True)
+                self._bubble_open("ai")
+                if "*" in str(content):
+                    self._chat_append_html(self._md_to_html(str(content)))
+                else:
+                    self._chat_append_plain(str(content))
+                self._close_bubble()
+            elif role == "user":
+                if not content:
+                    continue
+                self._close_bubble()
+                self._chat_break(double=True)
+                self._bubble_open("user")
+                self._chat_append_plain(str(content))
+                self._close_bubble()
             elif role == "tool":
                 args = pending.get(msg.get("tool_call_id") or "")
                 summary = _args_summary(msg.get("name") or "", args)
                 bad = str(content or "").startswith("ERROR[")
+                result = str(content or "")
+                self._close_bubble()
                 self._chat_break()
-                self._chat_append_html(
-                    "<span style='color:%s; font-family:Consolas,monospace; "
-                    "font-size:11px'>&#9656; %s — %s</span>"
-                    % ("#b42318" if bad else "#5f6368", html.escape(summary),
-                       "error" if bad else "ok")
-                )
-                continue
-            elif not content:
-                continue
-            self._chat_break(double=True)
-            if role == "user":
-                self._chat_append_html(
-                    "<span style='color:#1a7f37; font-size:12px'><b>Vos:</b> "
-                )
-            else:
-                self._chat_append_html(
-                    "<span style='font-size:12px'><b>Copla:</b> "
-                )
-            self._chat_append_plain(str(content))
-            self._chat_append_html("</span>")
+                self._tool_chip(summary, "error" if bad else "ok", result)
+                img = self._tool_image_path(msg.get("name") or "", result)
+                if img:
+                    self._chat_break()
+                    self._bubble_open("ai")
+                    self._chat_append_html("<img src='%s' width='300'>" % img)
+                    self._close_bubble()
+        self._close_bubble()
         self._chat_scroll(force=True)
+
+
+class _ChatView(QTextEdit):
+    anchor_clicked = pyqtSignal(str)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            cursor = self.cursorForPosition(event.pos())
+            cursor.movePosition(cursor.StartOfChar, cursor.KeepAnchor)
+            href = cursor.charFormat().anchorHref()
+            if href:
+                self.anchor_clicked.emit(href)
+                return
+        super().mouseReleaseEvent(event)
 
 
 class _ChatInput(QTextEdit):

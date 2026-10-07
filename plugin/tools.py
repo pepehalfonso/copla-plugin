@@ -5,9 +5,12 @@ execute-arbitrary-code tool: safety for a public tool means the AI can
 only call operations that were written and reviewed by maintainers.
 """
 
+import json as _json
 import os
 import shutil
 import sys
+import tempfile
+import time
 import urllib.parse
 
 from qgis.core import (
@@ -25,9 +28,13 @@ from qgis.core import (
     QgsGeometry,
     QgsGraduatedSymbolRenderer,
     QgsLayoutExporter,
+    QgsLayoutItemMap,
+    QgsLayoutPoint,
+    QgsLayoutSize,
     QgsMapRendererSequentialJob,
     QgsNetworkAccessManager,
     QgsPalLayerSettings,
+    QgsPrintLayout,
     QgsProcessingFeedback,
     QgsProcessingParameterDefinition,
     QgsProject,
@@ -40,12 +47,13 @@ from qgis.core import (
     QgsSymbol,
     QgsTextBufferSettings,
     QgsTextFormat,
+    QgsUnitTypes,
     QgsVectorFileWriter,
     QgsVectorLayer,
     QgsVectorLayerSimpleLabeling,
     QgsWkbTypes,
 )
-from qgis.PyQt.QtCore import QEventLoop, QSize, QTimer, QUrl, QVariant
+from qgis.PyQt.QtCore import QByteArray, QEventLoop, QSize, QTimer, QUrl, QVariant
 from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtNetwork import QNetworkReply, QNetworkRequest
 from qgis.utils import iface
@@ -589,6 +597,82 @@ def _http_get_bytes(url, max_bytes, timeout_ms=60000):
     return data, str(content_type or "")
 
 
+def _http_post_bytes(url, payload, content_type, headers, max_bytes, timeout_ms=60000):
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ToolError("Only http:// and https:// URLs are supported", code="bad_args")
+    request = QNetworkRequest(QUrl(url))
+    request.setRawHeader(b"User-Agent", b"Copla-QGIS-Plugin")
+    if content_type:
+        request.setRawHeader(b"Content-Type", str(content_type).encode("utf-8"))
+    for key, value in (headers or {}).items():
+        request.setRawHeader(str(key).encode("utf-8"), str(value).encode("utf-8"))
+    body = QByteArray(bytes(payload))
+    reply = QgsNetworkAccessManager.instance().post(request, body)
+    loop = QEventLoop()
+    state = {"timeout": False, "overflow": False}
+    timer = QTimer()
+    timer.setSingleShot(True)
+
+    def on_timeout():
+        state["timeout"] = True
+        reply.abort()
+        loop.quit()
+
+    def on_progress(received, total):
+        if received > max_bytes or (total and total > max_bytes):
+            state["overflow"] = True
+            reply.abort()
+            loop.quit()
+
+    timer.timeout.connect(on_timeout)
+    reply.downloadProgress.connect(on_progress)
+    reply.finished.connect(loop.quit)
+    timer.start(timeout_ms)
+    loop.exec_()
+    timer.stop()
+    for sig, fn in ((reply.downloadProgress, on_progress), (reply.finished, loop.quit), (timer.timeout, on_timeout)):
+        try:
+            sig.disconnect(fn)
+        except (TypeError, RuntimeError):
+            pass
+    status = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
+    resp_content_type = reply.header(QNetworkRequest.ContentTypeHeader)
+    if state["timeout"]:
+        reply.deleteLater()
+        raise ToolError("Timed out posting to %s" % url, code="io_error")
+    if state["overflow"]:
+        reply.deleteLater()
+        raise ToolError(
+            "Response larger than the %d MB limit" % (max_bytes // (1024 * 1024)),
+            code="io_error",
+        )
+    error = reply.error()
+    data = bytes(reply.readAll())
+    reply.deleteLater()
+    if status is None:
+        if error != QNetworkReply.NoError:
+            raise ToolError("HTTP error for %s: %s" % (url, _http_error_text(error)), code="io_error")
+        return data, str(resp_content_type or ""), None
+    return data, str(resp_content_type or ""), int(status)
+
+
+def _http_error_text(error):
+    for const, text in (
+        (QNetworkReply.ConnectionRefusedError, "connection refused"),
+        (QNetworkReply.RemoteHostClosedError, "remote host closed the connection"),
+        (QNetworkReply.HostNotFoundError, "host not found"),
+        (QNetworkReply.TimeoutError, "timed out"),
+        (QNetworkReply.SslHandshakeFailedError, "TLS handshake failed"),
+        (QNetworkReply.OperationCanceledError, "operation cancelled"),
+        (QNetworkReply.ProxyConnectionRefusedError, "proxy refused the connection"),
+        (QNetworkReply.AuthenticationRequiredError, "authentication required"),
+    ):
+        if error == const:
+            return text
+    return "network error (%s)" % int(error)
+
+
 @tool("download_layer", "Download a geodata file from an http(s) URL into the local Copla cache and add it as a layer. Works with geojson, gpkg, kml, csv, zip (shapefile bundle), tif, ... Max 100 MB.", params={
     "url": {"type": "string", "required": True, "description": "Direct http(s) URL of the data file"},
     "name": {"type": "string", "required": False, "description": "Layer name; defaults to the file name"},
@@ -633,6 +717,36 @@ def http_get(url):
     return {
         "url": url,
         "content_type": content_type,
+        "bytes": len(data),
+        "truncated": len(data) >= 200 * 1024,
+        "body": data.decode("utf-8", "replace"),
+    }
+
+
+@tool("http_post", "Send an HTTP POST request (JSON body by default) and return status and response text. Useful for APIs that require POST (max 200 KB response).", params={
+    "url": {"type": "string", "required": True, "description": "http(s) URL to POST to"},
+    "json": {"type": "object", "required": False, "description": "JSON body, sent with Content-Type application/json (not combinable with body)"},
+    "body": {"type": "string", "required": False, "description": "Raw text body instead of JSON (not combinable with json)"},
+    "headers": {"type": "object", "required": False, "description": "Extra request headers, e.g. {\"Authorization\": \"Bearer ...\"}"},
+    "content_type": {"type": "string", "required": False, "description": "Content-Type for a raw body (default text/plain)"},
+}, mutates=False)
+def http_post(url, json=None, body=None, headers=None, content_type=None):
+    if json is not None and body is not None:
+        raise ToolError("Pass either json or body, not both", code="bad_args")
+    if json is not None:
+        payload = _json.dumps(json).encode("utf-8")
+        ctype = "application/json"
+    else:
+        payload = (body or "").encode("utf-8")
+        ctype = content_type or "text/plain; charset=utf-8"
+    data, resp_ctype, status = _http_post_bytes(
+        url, payload, ctype, headers, max_bytes=200 * 1024, timeout_ms=30000
+    )
+    return {
+        "url": url,
+        "status": status,
+        "ok": bool(status is not None and 200 <= status < 300),
+        "content_type": resp_ctype,
         "bytes": len(data),
         "truncated": len(data) >= 200 * 1024,
         "body": data.decode("utf-8", "replace"),
@@ -684,6 +798,75 @@ def remove_layer(layer):
     name = lyr.name()
     _project().removeMapLayer(lyr.id())
     return {"removed": name}
+
+
+@tool("remove_group", "Remove a group from the layer tree, along with the layers and subgroups inside it (they leave the project; files on disk are not deleted).", params={
+    "group": {"type": "string", "required": True, "description": "Group name (top level or nested)"},
+}, mutates=True)
+def remove_group(group):
+    root = _project().layerTreeRoot()
+    node = root.findGroup(group)
+    if node is None:
+        raise ToolError("Group not found: %s" % group, code="not_found")
+    layer_ids = [l.layer().id() for l in node.findLayers() if l.layer()]
+    removed_layers = [l.name() for l in node.findLayers()]
+    if layer_ids:
+        _project().removeMapLayers(layer_ids)
+    node.parent().removeChildNode(node)
+    return {"removed": group, "layers": removed_layers}
+
+
+@tool("create_group", "Create a group (folder) in the layer tree to organize layers. Does nothing if it already exists.", params={
+    "name": {"type": "string", "required": True, "description": "New group name"},
+}, mutates=True)
+def create_group(name):
+    root = _project().layerTreeRoot()
+    node = root.findGroup(name)
+    if node is not None:
+        return {"group": node.name(), "created": False}
+    node = root.addGroup(name)
+    return {"group": node.name(), "created": True}
+
+
+@tool("rename_group", "Rename a group in the layer tree.", params={
+    "group": {"type": "string", "required": True, "description": "Group name (top level or nested)"},
+    "name": {"type": "string", "required": True, "description": "New group name"},
+}, mutates=True)
+def rename_group(group, name):
+    root = _project().layerTreeRoot()
+    node = root.findGroup(group)
+    if node is None:
+        raise ToolError("Group not found: %s" % group, code="not_found")
+    existing = root.findGroup(name)
+    if existing is not None and existing is not node:
+        raise ToolError("A group named '%s' already exists" % name, code="io_error")
+    old = node.name()
+    node.setName(name)
+    return {"renamed": old, "to": name}
+
+
+@tool("move_layer", "Move a layer into a group of the layer tree (the group is created if missing). Layers already in the project are reused; nothing is deleted.", params={
+    "layer": {"type": "string", "required": True, "description": "Layer id or name"},
+    "group": {"type": "string", "required": False, "description": "Destination group name (created if missing); omit to move to the top level"},
+}, mutates=True)
+def move_layer(layer, group=None):
+    lyr = find_layer(layer)
+    root = _project().layerTreeRoot()
+    node = root.findLayer(lyr)
+    if node is None:
+        raise ToolError("Layer has no tree node", code="tool_error")
+    if group:
+        dest = root.findGroup(group)
+        if dest is None:
+            dest = root.addGroup(group)
+    else:
+        dest = root
+    parent = node.parent()
+    dest.addLayer(lyr)
+    parent.removeChildNode(node)
+    if iface is not None:
+        iface.mapCanvas().refresh()
+    return {"layer": lyr.name(), "group": group or "(top level)"}
 
 
 @tool("rename_layer", "Rename a layer.", params={
@@ -1032,6 +1215,141 @@ def update_attributes(layer, values, expression=None, feature_ids=None):
     return {"layer": lyr.name(), "updated": updated, "fields": list(values)}
 
 
+@tool("add_field", "Add a new attribute field to a vector layer. The layer must have no pending edits.", params={
+    "layer": {"type": "string", "required": True, "description": "Vector layer id or name"},
+    "name": {"type": "string", "required": True, "description": "New field name"},
+    "type": {"type": "string", "required": True, "enum": ["string", "integer", "real"], "description": "Field type"},
+    "length": {"type": "integer", "required": False, "description": "Max characters for string fields (default 80)"},
+}, mutates=True)
+def add_field(layer, name, type, length=None):
+    lyr = _vector_layer(layer, "add_field")
+    if lyr.fields().indexFromName(name) >= 0:
+        raise ToolError("Field '%s' already exists" % name, code="io_error")
+    if lyr.isEditable():
+        raise ToolError("Layer has pending edits; commit them first", code="tool_error")
+    vtype = {"string": QVariant.String, "integer": QVariant.Int, "real": QVariant.Double}[type]
+    field = QgsField(name, vtype)
+    if type == "string":
+        field.setLength(max(1, int(length) if length else 80))
+    if not lyr.dataProvider().addAttributes([field]):
+        raise ToolError("The provider rejected the new field", code="tool_error")
+    lyr.updateFields()
+    return {"layer": lyr.name(), "field": name, "type": type}
+
+
+@tool("remove_field", "Delete an attribute field from a vector layer. The data in that column is lost. The layer must have no pending edits.", params={
+    "layer": {"type": "string", "required": True, "description": "Vector layer id or name"},
+    "field": {"type": "string", "required": True, "description": "Field name to delete"},
+}, mutates=True)
+def remove_field(layer, field):
+    lyr = _vector_layer(layer, "remove_field")
+    idx = _field_index(lyr, field)
+    if lyr.isEditable():
+        raise ToolError("Layer has pending edits; commit them first", code="tool_error")
+    if not lyr.dataProvider().deleteAttributes([idx]):
+        raise ToolError("The provider rejected the field deletion", code="tool_error")
+    lyr.updateFields()
+    return {"layer": lyr.name(), "removed_field": field}
+
+
+@tool("rename_field", "Rename an attribute field of a vector layer. The layer must have no pending edits.", params={
+    "layer": {"type": "string", "required": True, "description": "Vector layer id or name"},
+    "field": {"type": "string", "required": True, "description": "Current field name"},
+    "new_name": {"type": "string", "required": True, "description": "New field name"},
+}, mutates=True)
+def rename_field(layer, field, new_name):
+    lyr = _vector_layer(layer, "rename_field")
+    idx = _field_index(lyr, field)
+    if new_name == field:
+        return {"layer": lyr.name(), "renamed": field, "to": new_name}
+    if lyr.fields().indexFromName(new_name) >= 0:
+        raise ToolError("Field '%s' already exists" % new_name, code="io_error")
+    if lyr.isEditable():
+        raise ToolError("Layer has pending edits; commit them first", code="tool_error")
+    if not lyr.dataProvider().renameAttributes({idx: new_name}):
+        raise ToolError("The provider rejected the rename", code="tool_error")
+    lyr.updateFields()
+    return {"layer": lyr.name(), "renamed": field, "to": new_name}
+
+
+@tool("calculate_field", "Fill or update an attribute field with the result of a QGIS expression evaluated for each feature. Example: field='area_km2', expression='$area / 1000000'. Edits are committed when done.", params={
+    "layer": {"type": "string", "required": True, "description": "Vector layer id or name (must be editable)"},
+    "field": {"type": "string", "required": True, "description": "Target field (must exist; add it first with add_field)"},
+    "expression": {"type": "string", "required": True, "description": "QGIS expression evaluated per feature, e.g. $area / 1000000 or upper(name)"},
+    "filter": {"type": "string", "required": False, "description": "Only update features matching this expression"},
+}, mutates=True)
+def calculate_field(layer, field, expression, filter=None):
+    lyr = _vector_layer(layer, "calculate_field")
+    idx = _field_index(lyr, field)
+    expr = QgsExpression(expression)
+    if expr.hasParserError():
+        raise ToolError("Expression parse error: %s" % expr.parserErrorString(), code="bad_args")
+    request = QgsFeatureRequest()
+    if filter:
+        probe = QgsExpression(filter)
+        if probe.hasParserError():
+            raise ToolError("Invalid filter expression: %s" % probe.parserErrorString(), code="bad_args")
+        request.setFilterExpression(filter)
+    if not lyr.startEditing():
+        raise ToolError("Layer '%s' is not editable" % lyr.name(), code="tool_error")
+    updated = 0
+    base_context = lyr.createExpressionContext()
+    try:
+        for feat in lyr.getFeatures(request):
+            context = QgsExpressionContext(base_context)
+            context.setFeature(feat)
+            value = expr.evaluate(context)
+            if expr.hasEvalError():
+                raise ToolError("Expression eval error: %s" % expr.evalErrorString(), code="tool_error")
+            if not lyr.changeAttributeValue(feat.id(), idx, value):
+                raise ToolError("QGIS rejected the value on feature %s" % feat.id(), code="tool_error")
+            updated += 1
+        if not lyr.commitChanges():
+            raise ToolError("Could not commit the changes", code="tool_error")
+    except Exception:
+        lyr.rollBack()
+        raise
+    if iface is not None:
+        lyr.triggerRepaint()
+    return {"layer": lyr.name(), "field": field, "updated": updated}
+
+
+def _norm_attr(value):
+    if value is None:
+        return None
+    if isinstance(value, float) and value != value:
+        return None
+    if isinstance(value, (int, float, bool, str)):
+        return value
+    text = str(value)
+    return None if text == "<NULL>" else text
+
+
+@tool("unique_values", "List the distinct values of a field with their counts (most frequent first). Useful before using a categorized renderer.", params={
+    "layer": {"type": "string", "required": True, "description": "Vector layer id or name"},
+    "field": {"type": "string", "required": True, "description": "Field name"},
+    "limit": {"type": "integer", "required": False, "description": "Max values to return (default 200, max 1000)"},
+})
+def unique_values(layer, field, limit=200):
+    lyr = _vector_layer(layer, "unique_values")
+    idx = _field_index(lyr, field)
+    limit = max(1, min(int(limit), 1000))
+    request = QgsFeatureRequest().setSubsetOfAttributes([idx])
+    counts = {}
+    for feat in lyr.getFeatures(request):
+        value = _norm_attr(feat[field])
+        counts[value] = counts.get(value, 0) + 1
+    items = sorted(counts.items(), key=lambda kv: (-kv[1], str(kv[0])))
+    out = [{"value": v, "count": c} for v, c in items[:limit]]
+    return {
+        "layer": lyr.name(),
+        "field": field,
+        "distinct": len(counts),
+        "returned": len(out),
+        "values": out,
+    }
+
+
 # ---------------------------------------------------------------- style
 
 @tool("set_renderer", "Set vector layer symbology: 'single' (one color), 'categorized' (unique values of a field) or 'graduated' (numeric classes). Optionally pass custom colors or a color ramp name.", params={
@@ -1140,6 +1458,77 @@ def set_labels(layer, enabled, field=None, size=10, color="#000000", halo=True, 
     return {"layer": lyr.name(), "labels": True, "field": field, "size": float(size)}
 
 
+def _style_result(result):
+    if isinstance(result, tuple):
+        message = str(result[0]) if result else ""
+        ok = bool(result[1]) if len(result) > 1 else True
+        return ok, message
+    return True, ""
+
+
+@tool("save_style", "Save a layer's style (renderer, labels, symbols) to a .qml file.", params={
+    "layer": {"type": "string", "required": True, "description": "Layer id or name"},
+    "path": {"type": "string", "required": True, "description": "Destination .qml file (parent folders are created)"},
+}, mutates=True)
+def save_style(layer, path):
+    lyr = find_layer(layer)
+    if os.path.splitext(path)[1].lower() != ".qml":
+        raise ToolError("path must end in .qml", code="bad_args")
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    ok, message = _style_result(lyr.saveNamedStyle(path))
+    if not ok:
+        raise ToolError("Could not save style: %s" % message, code="io_error")
+    if not os.path.exists(path):
+        raise ToolError("Style file was not written: %s" % path, code="io_error")
+    return {"layer": lyr.name(), "saved": os.path.abspath(path)}
+
+
+@tool("load_style", "Apply a .qml style file to a layer.", params={
+    "layer": {"type": "string", "required": True, "description": "Layer id or name"},
+    "path": {"type": "string", "required": True, "description": "Path to an existing .qml file"},
+}, mutates=True)
+def load_style(layer, path):
+    lyr = find_layer(layer)
+    if not os.path.isfile(path):
+        raise ToolError("Style file not found: %s" % path, code="not_found")
+    ok, message = _style_result(lyr.loadNamedStyle(path))
+    if not ok:
+        raise ToolError("Could not load style: %s" % message, code="io_error")
+    if iface is not None:
+        lyr.triggerRepaint()
+    return {"layer": lyr.name(), "loaded": os.path.abspath(path)}
+
+
+@tool("copy_style", "Copy the style (renderer, labels) from one layer to another.", params={
+    "source": {"type": "string", "required": True, "description": "Layer id or name whose style is copied"},
+    "target": {"type": "string", "required": True, "description": "Layer id or name that receives the style"},
+}, mutates=True)
+def copy_style(source, target):
+    src = find_layer(source)
+    dst = find_layer(target)
+    if src.id() == dst.id():
+        raise ToolError("source and target are the same layer", code="bad_args")
+    fd, tmp = tempfile.mkstemp(suffix=".qml", prefix="copla_style_")
+    os.close(fd)
+    try:
+        ok, message = _style_result(src.saveNamedStyle(tmp))
+        if not ok or not os.path.exists(tmp):
+            raise ToolError("Could not read the source style: %s" % message, code="io_error")
+        ok, message = _style_result(dst.loadNamedStyle(tmp))
+        if not ok:
+            raise ToolError("Could not apply the style: %s" % message, code="io_error")
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    if iface is not None:
+        dst.triggerRepaint()
+    return {"from": src.name(), "to": dst.name()}
+
+
 # ---------------------------------------------------------------- view & selection
 
 @tool("set_extent", "Zoom the map canvas to an extent [xmin, ymin, xmax, ymax]. Optionally pass the CRS of those coordinates if it differs from the project CRS.", params={
@@ -1201,6 +1590,78 @@ def zoom_to_selection(layer):
     return {"layer": lyr.name(), "selected": count, "extent": _extent_list(iface.mapCanvas().extent())}
 
 
+_SELECT_PREDICATES = {
+    "intersects": 0,
+    "contains": 1,
+    "disjoint": 2,
+    "equals": 3,
+    "touches": 4,
+    "overlaps": 5,
+    "within": 6,
+    "crosses": 7,
+}
+_SELECT_METHODS = {"new": 0, "add": 1, "within": 2, "remove": 3}
+
+
+@tool("select_by_location", "Select features of a layer based on their spatial relationship with another layer (like the 'Select by location' toolbox). The selection stays visible in the QGIS UI.", params={
+    "layer": {"type": "string", "required": True, "description": "Vector layer id or name whose features will be selected"},
+    "other": {"type": "string", "required": True, "description": "Reference vector layer to test against"},
+    "predicate": {"type": "string", "required": False, "enum": ["intersects", "contains", "disjoint", "equals", "touches", "overlaps", "within", "crosses"], "description": "Spatial relationship (default intersects)"},
+    "method": {"type": "string", "required": False, "enum": ["new", "add", "within", "remove"], "description": "new = replace selection, add = add to current, within = keep only what is already selected, remove = deselect matching (default new)"},
+}, mutates=True)
+def select_by_location(layer, other, predicate="intersects", method="new"):
+    if processing is None:
+        raise ToolError("Processing plugin is not available", code="tool_error")
+    lyr = _vector_layer(layer, "select_by_location")
+    ref = _vector_layer(other, "select_by_location")
+    if not lyr.isSpatial():
+        raise ToolError("Layer '%s' has no geometry" % lyr.name(), code="bad_args")
+    if not ref.isSpatial():
+        raise ToolError("Reference layer '%s' has no geometry" % ref.name(), code="bad_args")
+    feedback = _CollectFeedback()
+    try:
+        processing.run("native:selectbylocation", {
+            "INPUT": lyr,
+            "PREDICATE": [_SELECT_PREDICATES[predicate]],
+            "INTERSECT": ref,
+            "METHOD": _SELECT_METHODS[method],
+        }, feedback=feedback)
+    except Exception as exc:
+        raise ToolError(
+            "selectbylocation failed: %s\n%s" % (exc, "\n".join(feedback.lines[-20:])),
+            code="run_error",
+        )
+    if iface is not None:
+        iface.mapCanvas().refresh()
+    return {"layer": lyr.name(), "predicate": predicate, "selected": lyr.selectedFeatureCount()}
+
+
+@tool("zoom_to_project", "Pan and zoom the map canvas so all layers of the project fit in view.", mutates=True)
+def zoom_to_project():
+    if iface is None:
+        raise ToolError("No GUI available (headless session)", code="tool_error")
+    project = _project()
+    dest = project.crs()
+    union = None
+    for lyr in project.mapLayers().values():
+        extent = lyr.extent()
+        if extent is None or extent.isNull():
+            continue
+        if dest.isValid() and lyr.crs().isValid() and lyr.crs() != dest:
+            extent = QgsCoordinateTransform(lyr.crs(), dest, project).transformBoundingBox(extent)
+        if union is None:
+            union = QgsRectangle(extent)
+        else:
+            union.combineExtentWith(extent)
+    if union is None:
+        raise ToolError("The project has no layers with an extent to zoom to", code="tool_error")
+    union.grow(max(union.width(), union.height()) * 0.05)
+    canvas = iface.mapCanvas()
+    canvas.setExtent(union)
+    canvas.refresh()
+    return {"extent": _extent_list(canvas.extent())}
+
+
 # ---------------------------------------------------------------- files
 
 @tool("list_directory", "List files and folders inside a directory (name, kind, size). Max 500 entries.", params={
@@ -1248,6 +1709,128 @@ def move_file(src, dst):
     except (OSError, shutil.Error) as exc:
         raise ToolError("Move failed: %s" % exc, code="io_error")
     return {"moved": src, "to": dst}
+
+
+@tool("read_file", "Read a text file from disk and return its content (text/UTF-8 only, max 200 KB).", params={
+    "path": {"type": "string", "required": True, "description": "Absolute path of the text file"},
+    "encoding": {"type": "string", "required": False, "description": "Text encoding (default utf-8)"},
+    "max_bytes": {"type": "integer", "required": False, "description": "Max bytes to read (default 204800, max 1048576)"},
+})
+def read_file(path, encoding=None, max_bytes=None):
+    if not os.path.isfile(path):
+        raise ToolError("File not found: %s" % path, code="not_found")
+    limit = max(1, min(int(max_bytes) if max_bytes else 200 * 1024, 1024 * 1024))
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read(limit + 1)
+    except OSError as exc:
+        raise ToolError("Could not read %s: %s" % (path, exc), code="io_error")
+    truncated = len(data) > limit
+    data = data[:limit]
+    if b"\x00" in data[:4096]:
+        raise ToolError("'%s' looks like a binary file; read_file only handles text" % path, code="bad_args")
+    try:
+        text = data.decode(encoding or "utf-8")
+    except (LookupError, UnicodeDecodeError) as exc:
+        raise ToolError("Could not decode the file as %s: %s" % (encoding or "utf-8", exc), code="io_error")
+    return {"path": os.path.abspath(path), "bytes": len(data), "truncated": truncated, "content": text}
+
+
+@tool("file_info", "Get metadata about a file or folder: kind, size, extension and last modification time.", params={
+    "path": {"type": "string", "required": True, "description": "Absolute path"},
+})
+def file_info(path):
+    if not os.path.exists(path):
+        raise ToolError("Not found: %s" % path, code="not_found")
+    is_dir = os.path.isdir(path)
+    st = os.stat(path)
+    return {
+        "path": os.path.abspath(path),
+        "kind": "dir" if is_dir else "file",
+        "size": None if is_dir else st.st_size,
+        "ext": "" if is_dir else os.path.splitext(path)[1].lower(),
+        "modified": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime)),
+    }
+
+
+@tool("copy_file", "Copy a file or folder on disk. Creates destination folders as needed; the destination must not exist.", params={
+    "src": {"type": "string", "required": True, "description": "Absolute path of the source file or folder"},
+    "dst": {"type": "string", "required": True, "description": "Absolute destination path"},
+}, mutates=True)
+def copy_file(src, dst):
+    if not os.path.exists(src):
+        raise ToolError("Source not found: %s" % src, code="not_found")
+    dst = os.path.abspath(dst)
+    if os.path.exists(dst):
+        raise ToolError("Destination already exists: %s" % dst, code="io_error")
+    parent = os.path.dirname(dst)
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as exc:
+            raise ToolError("Could not create %s: %s" % (parent, exc), code="io_error")
+    try:
+        if os.path.isdir(src):
+            shutil.copytree(src, dst)
+        else:
+            shutil.copy2(src, dst)
+    except (OSError, shutil.Error) as exc:
+        raise ToolError("Copy failed: %s" % exc, code="io_error")
+    return {"copied": os.path.abspath(src), "to": dst}
+
+
+@tool("delete_file", "Delete a file (or a folder with recursive=true) from disk. This cannot be undone.", params={
+    "path": {"type": "string", "required": True, "description": "Absolute path to delete"},
+    "recursive": {"type": "boolean", "required": False, "description": "Required to delete a folder and its contents (default false)"},
+}, mutates=True)
+def delete_file(path, recursive=False):
+    target = os.path.abspath(path)
+    if not os.path.exists(target):
+        raise ToolError("Not found: %s" % target, code="not_found")
+    if os.path.dirname(target) == target:
+        raise ToolError("Refusing to delete a filesystem root", code="bad_args")
+    profile = os.path.abspath(QgsApplication.qgisSettingsDirPath())
+    if target == profile:
+        raise ToolError("Refusing to delete the QGIS profile directory", code="bad_args")
+    is_dir = os.path.isdir(target)
+    if is_dir and not recursive:
+        raise ToolError(
+            "'%s' is a folder; pass recursive=true to delete it and its contents" % target,
+            code="bad_args",
+        )
+    try:
+        if is_dir:
+            shutil.rmtree(target)
+        else:
+            os.remove(target)
+    except OSError as exc:
+        raise ToolError("Delete failed: %s" % exc, code="io_error")
+    return {"deleted": target, "kind": "dir" if is_dir else "file"}
+
+
+@tool("download_file", "Download a http(s) URL to a local file (max 100 MB). The destination must not exist.", params={
+    "url": {"type": "string", "required": True, "description": "Direct http(s) URL"},
+    "path": {"type": "string", "required": True, "description": "Absolute destination path"},
+}, mutates=True)
+def download_file(url, path):
+    data, content_type = _http_get_bytes(url, max_bytes=100 * 1024 * 1024, timeout_ms=120000)
+    if not data:
+        raise ToolError("The URL returned an empty body", code="io_error")
+    path = os.path.abspath(path)
+    if os.path.exists(path):
+        raise ToolError("Destination already exists: %s" % path, code="io_error")
+    parent = os.path.dirname(path)
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as exc:
+            raise ToolError("Could not create %s: %s" % (parent, exc), code="io_error")
+    try:
+        with open(path, "wb") as fh:
+            fh.write(data)
+    except OSError as exc:
+        raise ToolError("Could not write %s: %s" % (path, exc), code="io_error")
+    return {"saved": path, "bytes": len(data), "content_type": content_type}
 
 
 # ---------------------------------------------------------------- processing
@@ -1384,13 +1967,140 @@ def run_algorithm(id, params):
     return {"algorithm": id, "outputs": outputs, "log": feedback.lines[-50:]}
 
 
+def _alg_output_path(name):
+    cache = os.path.join(QgsApplication.qgisSettingsDirPath(), "copla_cache")
+    os.makedirs(cache, exist_ok=True)
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in name).strip("_") or "result"
+    path = os.path.join(cache, safe + ".gpkg")
+    if os.path.exists(path):
+        stamp = int(time.time())
+        path = os.path.join(cache, "%s_%d.gpkg" % (safe, stamp))
+        n = 1
+        while os.path.exists(path):
+            path = os.path.join(cache, "%s_%d_%d.gpkg" % (safe, stamp, n))
+            n += 1
+    return path
+
+
+def _run_alg_to_layer(alg_id, params, name, group=None):
+    if processing is None:
+        raise ToolError("Processing plugin is not available", code="tool_error")
+    alg = QgsApplication.processingRegistry().algorithmById(alg_id)
+    if alg is None:
+        raise ToolError("Algorithm not found: %s" % alg_id, code="tool_error")
+    target = _alg_output_path(name)
+    run_params = dict(params)
+    run_params["OUTPUT"] = target
+    feedback = _CollectFeedback()
+    try:
+        processing.run(alg_id, run_params, feedback=feedback)
+    except Exception as exc:
+        raise ToolError(
+            "Algorithm failed: %s\n%s" % (exc, "\n".join(feedback.lines[-20:])),
+            code="run_error",
+        )
+    if not os.path.exists(target):
+        raise ToolError("Algorithm finished but %s was not created" % target, code="run_error")
+    return _load_layer_from_path(target, name, group)
+
+
+@tool("buffer", "Buffer vector features by a distance and add the result as a new layer. distance is in the layer CRS units: use meters only if the layer CRS uses meters.", params={
+    "layer": {"type": "string", "required": True, "description": "Vector layer id or name"},
+    "distance": {"type": "number", "required": True, "description": "Buffer distance in layer CRS units"},
+    "segments": {"type": "integer", "required": False, "description": "Segments per quarter circle (default 5)"},
+    "dissolve": {"type": "boolean", "required": False, "description": "Merge overlapping buffers into one feature (default false)"},
+    "name": {"type": "string", "required": False, "description": "Result layer name (default '<layer>_buffer')"},
+    "group": {"type": "string", "required": False, "description": "Layer-tree group for the result (created if missing)"},
+}, mutates=True)
+def buffer(layer, distance, segments=5, dissolve=False, name=None, group=None):
+    lyr = _vector_layer(layer, "buffer")
+    params = {
+        "INPUT": lyr,
+        "DISTANCE": float(distance),
+        "SEGMENTS": int(segments),
+        "DISSOLVE": bool(dissolve),
+    }
+    return _run_alg_to_layer("native:buffer", params, name or (lyr.name() + "_buffer"), group)
+
+
+@tool("reproject_layer", "Reproject a vector layer to another CRS and add the result as a new layer.", params={
+    "layer": {"type": "string", "required": True, "description": "Vector layer id or name"},
+    "crs": {"type": "string", "required": True, "description": "Target CRS, e.g. EPSG:3857"},
+    "name": {"type": "string", "required": False, "description": "Result layer name (default '<layer>_<crs>')"},
+    "group": {"type": "string", "required": False, "description": "Layer-tree group for the result (created if missing)"},
+}, mutates=True)
+def reproject_layer(layer, crs, name=None, group=None):
+    lyr = _vector_layer(layer, "reproject_layer")
+    target = QgsCoordinateReferenceSystem(crs)
+    if not target.isValid():
+        raise ToolError("Invalid CRS: %s" % crs, code="bad_args")
+    suffix = target.authid().replace(":", "").replace("/", "_") or "reproj"
+    return _run_alg_to_layer(
+        "native:reprojectlayer",
+        {"INPUT": lyr, "TARGET_CRS": target},
+        name or ("%s_%s" % (lyr.name(), suffix)),
+        group,
+    )
+
+
+@tool("clip", "Cut a vector layer with a polygon overlay layer (keep only what falls inside) and add the result as a new layer.", params={
+    "layer": {"type": "string", "required": True, "description": "Vector layer to clip"},
+    "overlay": {"type": "string", "required": True, "description": "Polygon layer used as the cookie cutter (vector id or name)"},
+    "name": {"type": "string", "required": False, "description": "Result layer name (default '<layer>_clip')"},
+    "group": {"type": "string", "required": False, "description": "Layer-tree group for the result (created if missing)"},
+}, mutates=True)
+def clip(layer, overlay, name=None, group=None):
+    lyr = _vector_layer(layer, "clip")
+    ov = _vector_layer(overlay, "clip")
+    params = {"INPUT": lyr, "OVERLAY": ov}
+    return _run_alg_to_layer("native:clip", params, name or (lyr.name() + "_clip"), group)
+
+
+@tool("intersection", "Intersect two vector layers (keep parts of 'layer' that overlap 'overlay', with attributes of both) and add the result as a new layer.", params={
+    "layer": {"type": "string", "required": True, "description": "Vector layer id or name"},
+    "overlay": {"type": "string", "required": True, "description": "Vector layer id or name to intersect with"},
+    "name": {"type": "string", "required": False, "description": "Result layer name (default '<layer>_intersection')"},
+    "group": {"type": "string", "required": False, "description": "Layer-tree group for the result (created if missing)"},
+}, mutates=True)
+def intersection(layer, overlay, name=None, group=None):
+    lyr = _vector_layer(layer, "intersection")
+    ov = _vector_layer(overlay, "intersection")
+    params = {"INPUT": lyr, "OVERLAY": ov}
+    return _run_alg_to_layer("native:intersection", params, name or (lyr.name() + "_intersection"), group)
+
+
+@tool("dissolve", "Merge features of a vector layer into one (optionally one result per value of a field) and add the result as a new layer.", params={
+    "layer": {"type": "string", "required": True, "description": "Vector layer id or name"},
+    "field": {"type": "string", "required": False, "description": "Group by this field (each unique value becomes one feature); omit to merge everything into one"},
+    "name": {"type": "string", "required": False, "description": "Result layer name (default '<layer>_dissolve')"},
+    "group": {"type": "string", "required": False, "description": "Layer-tree group for the result (created if missing)"},
+}, mutates=True)
+def dissolve(layer, field=None, name=None, group=None):
+    lyr = _vector_layer(layer, "dissolve")
+    params = {"INPUT": lyr}
+    if field:
+        _field_index(lyr, field)
+        params["FIELD"] = [field]
+    return _run_alg_to_layer("native:dissolve", params, name or (lyr.name() + "_dissolve"), group)
+
+
+@tool("fix_geometries", "Repair invalid geometries of a vector layer and add the result as a new layer.", params={
+    "layer": {"type": "string", "required": True, "description": "Vector layer id or name"},
+    "name": {"type": "string", "required": False, "description": "Result layer name (default '<layer>_fixed')"},
+    "group": {"type": "string", "required": False, "description": "Layer-tree group for the result (created if missing)"},
+}, mutates=True)
+def fix_geometries(layer, name=None, group=None):
+    lyr = _vector_layer(layer, "fix_geometries")
+    return _run_alg_to_layer("native:fixgeometries", {"INPUT": lyr}, name or (lyr.name() + "_fixed"), group)
+
+
 # ---------------------------------------------------------------- rendering
 
 @tool("render_map", "Render the current map view to an image file (png/jpg). Optionally set size, extent and/or output CRS without changing the user's view permanently.", params={
     "output_path": {"type": "string", "required": True, "description": "Destination file, e.g. C:/maps/out.png"},
     "width": {"type": "integer", "required": False, "description": "Image width in px (default 1600)"},
     "height": {"type": "integer", "required": False, "description": "Image height in px (default 1000)"},
-    "extent": {"type": "array", "required": False, "description": "[xmin, ymin, xmax, ymax] to render instead of the current view"},
+    "extent": {"type": "array", "required": False, "description": "[xmin, ymin, xmax, ymax] to render instead of the current view. Geographic degrees (e.g. [-180, -85, 180, 85] for the whole world) or project CRS meters"},
     "crs": {"type": "string", "required": False, "description": "Output CRS, e.g. EPSG:4326 (default: current project CRS)"},
 }, mutates=False)
 def render_map(output_path, width=1600, height=1000, extent=None, crs=None):
@@ -1399,13 +2109,26 @@ def render_map(output_path, width=1600, height=1000, extent=None, crs=None):
     canvas = iface.mapCanvas()
     settings = canvas.mapSettings()
     settings.setOutputSize(QSize(int(width), int(height)))
-    if extent is not None:
-        settings.setExtent(_rect_from(extent))
     if crs:
         out_crs = QgsCoordinateReferenceSystem(crs)
         if not out_crs.isValid():
             raise ToolError("Invalid CRS: %s" % crs, code="bad_args")
-        settings.setOutputCrs(out_crs)
+        settings.setDestinationCrs(out_crs)
+    if extent is not None:
+        rect = _rect_from(extent)
+        target = settings.destinationCrs()
+        if (
+            abs(rect.xMinimum()) <= 180.0
+            and abs(rect.xMaximum()) <= 180.0
+            and abs(rect.yMinimum()) <= 90.0
+            and abs(rect.yMaximum()) <= 90.0
+            and target.isValid()
+            and target.authid() != "EPSG:4326"
+        ):
+            rect = QgsCoordinateTransform(
+                QgsCoordinateReferenceSystem("EPSG:4326"), target, _project()
+            ).transformBoundingBox(rect)
+        settings.setExtent(rect)
     job = QgsMapRendererSequentialJob(settings)
     job.start()
     job.waitForFinished()
@@ -1428,13 +2151,46 @@ def render_map(output_path, width=1600, height=1000, extent=None, crs=None):
 @tool("list_layouts", "List print layouts (atlas/composer layouts) in the project.")
 def list_layouts():
     out = []
-    for layout in _project().printLayouts():
+    for layout in _project().layoutManager().printLayouts():
         pages = []
         for i in range(layout.pageCollection().pageCount()):
             page = layout.pageCollection().page(i)
             pages.append({"width_mm": page.pageSize().width(), "height_mm": page.pageSize().height()})
         out.append({"name": layout.name(), "pages": pages})
     return {"count": len(out), "layouts": out}
+
+
+@tool("create_layout", "Create a print layout with a page and a map item showing the current view. Export it later with export_layout.", params={
+    "name": {"type": "string", "required": True, "description": "New layout name (must be unique)"},
+    "width_mm": {"type": "integer", "required": False, "description": "Page width in mm (default 210, A4 portrait)"},
+    "height_mm": {"type": "integer", "required": False, "description": "Page height in mm (default 297, A4 portrait)"},
+}, mutates=True)
+def create_layout(name, width_mm=210, height_mm=297):
+    project = _project()
+    manager = project.layoutManager()
+    for existing in manager.printLayouts():
+        if existing.name() == name:
+            raise ToolError("Layout '%s' already exists" % name, code="io_error")
+    w, h = float(width_mm), float(height_mm)
+    if w < 10 or h < 10 or w > 5000 or h > 5000:
+        raise ToolError("width_mm and height_mm must be between 10 and 5000", code="bad_args")
+    layout = QgsPrintLayout(project)
+    layout.setName(name)
+    manager.addLayout(layout)
+    layout.initializeDefaults()
+    pages = layout.pageCollection()
+    if pages.pageCount() > 0:
+        pages.page(0).setPageSize(QgsLayoutSize(w, h))
+    margin = 10.0
+    map_item = QgsLayoutItemMap(layout)
+    layout.addLayoutItem(map_item)
+    map_item.attemptMove(QgsLayoutPoint(margin, margin))
+    map_item.attemptResize(QgsLayoutSize(w - 2 * margin, h - 2 * margin))
+    if iface is not None:
+        extent = iface.mapCanvas().extent()
+        if extent is not None and not extent.isNull():
+            map_item.setExtent(extent)
+    return {"layout": name, "page_mm": [w, h], "items": len(layout.items())}
 
 
 @tool("export_layout", "Export a print layout to PDF or an image (png/jpg) using the layout's own page size. Use list_layouts for names.", params={
@@ -1444,14 +2200,14 @@ def list_layouts():
 }, mutates=False)
 def export_layout(name, output_path, dpi=300):
     layout = None
-    for candidate in _project().printLayouts():
+    for candidate in _project().layoutManager().printLayouts():
         if candidate.name() == name:
             layout = candidate
             break
     if layout is None:
         raise ToolError(
             "Layout '%s' not found. Available: %s"
-            % (name, ", ".join(l.name() for l in _project().printLayouts()) or "(none)"),
+            % (name, ", ".join(l.name() for l in _project().layoutManager().printLayouts()) or "(none)"),
             code="not_found",
         )
     folder = os.path.dirname(os.path.abspath(output_path))

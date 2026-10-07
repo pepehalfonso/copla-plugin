@@ -149,6 +149,27 @@ def http_get(url: str) -> dict:
 
 
 @mcp.tool()
+def http_post(
+    url: str,
+    json: dict | None = None,
+    body: str | None = None,
+    headers: dict | None = None,
+    content_type: str | None = None,
+) -> dict:
+    """Send an HTTP POST request (JSON body by default) and return status and response text (max 200 KB)."""
+    args: dict[str, Any] = {"url": url}
+    if json is not None:
+        args["json"] = json
+    if body is not None:
+        args["body"] = body
+    if headers:
+        args["headers"] = headers
+    if content_type:
+        args["content_type"] = content_type
+    return _call("http_post", args)
+
+
+@mcp.tool()
 def save_layer_as(layer: str, path: str) -> dict:
     """Export a layer to a file: vector to .gpkg/.geojson/.shp/.kml, raster to .tif/.img/.png."""
     return _call("save_layer_as", {"layer": layer, "path": path})
@@ -161,9 +182,36 @@ def remove_layer(layer: str) -> dict:
 
 
 @mcp.tool()
+def remove_group(group: str) -> dict:
+    """Remove a layer group from the project, along with its layers and subgroups (files on disk are kept)."""
+    return _call("remove_group", {"group": group})
+
+
+@mcp.tool()
 def rename_layer(layer: str, name: str) -> dict:
     """Rename a layer."""
     return _call("rename_layer", {"layer": layer, "name": name})
+
+
+@mcp.tool()
+def create_group(name: str) -> dict:
+    """Create a group (folder) in the layer tree; does nothing if it already exists."""
+    return _call("create_group", {"name": name})
+
+
+@mcp.tool()
+def rename_group(group: str, name: str) -> dict:
+    """Rename a layer-tree group."""
+    return _call("rename_group", {"group": group, "name": name})
+
+
+@mcp.tool()
+def move_layer(layer: str, group: str | None = None) -> dict:
+    """Move a layer into a layer-tree group (created if missing); omit group to move it to the top level."""
+    args: dict[str, Any] = {"layer": layer}
+    if group:
+        args["group"] = group
+    return _call("move_layer", args)
 
 
 @mcp.tool()
@@ -267,6 +315,42 @@ def update_attributes(
     return _call("update_attributes", args)
 
 
+@mcp.tool()
+def add_field(layer: str, name: str, type: str, length: int | None = None) -> dict:
+    """Add a new attribute field to a vector layer (type: 'string', 'integer' or 'real'). Layer must have no pending edits."""
+    args: dict[str, Any] = {"layer": layer, "name": name, "type": type}
+    if length is not None:
+        args["length"] = length
+    return _call("add_field", args)
+
+
+@mcp.tool()
+def remove_field(layer: str, field: str) -> dict:
+    """Delete an attribute field from a vector layer (the column data is lost). Layer must have no pending edits."""
+    return _call("remove_field", {"layer": layer, "field": field})
+
+
+@mcp.tool()
+def rename_field(layer: str, field: str, new_name: str) -> dict:
+    """Rename an attribute field of a vector layer. Layer must have no pending edits."""
+    return _call("rename_field", {"layer": layer, "field": field, "new_name": new_name})
+
+
+@mcp.tool()
+def calculate_field(layer: str, field: str, expression: str, filter: str | None = None) -> dict:
+    """Fill or update an attribute field with a QGIS expression evaluated per feature, e.g. expression='$area / 1000000'. Committed when done."""
+    args: dict[str, Any] = {"layer": layer, "field": field, "expression": expression}
+    if filter:
+        args["filter"] = filter
+    return _call("calculate_field", args)
+
+
+@mcp.tool()
+def unique_values(layer: str, field: str, limit: int = 200) -> dict:
+    """List the distinct values of a field with counts (most frequent first)."""
+    return _call("unique_values", {"layer": layer, "field": field, "limit": limit})
+
+
 # ------------------------------------------------------------------ style
 
 @mcp.tool()
@@ -319,6 +403,24 @@ def set_labels(
     return _call("set_labels", args)
 
 
+@mcp.tool()
+def save_style(layer: str, path: str) -> dict:
+    """Save a layer's style (renderer, labels, symbols) to a .qml file."""
+    return _call("save_style", {"layer": layer, "path": path})
+
+
+@mcp.tool()
+def load_style(layer: str, path: str) -> dict:
+    """Apply a .qml style file to a layer."""
+    return _call("load_style", {"layer": layer, "path": path})
+
+
+@mcp.tool()
+def copy_style(source: str, target: str) -> dict:
+    """Copy the style (renderer, labels) from one layer to another."""
+    return _call("copy_style", {"source": source, "target": target})
+
+
 # ------------------------------------------------------------------ files
 
 @mcp.tool()
@@ -331,6 +433,41 @@ def list_directory(path: str) -> dict:
 def move_file(src: str, dst: str) -> dict:
     """Move or rename a file or folder on disk; creates destination folders, destination must not exist."""
     return _call("move_file", {"src": src, "dst": dst})
+
+
+@mcp.tool()
+def read_file(path: str, encoding: str | None = None, max_bytes: int | None = None) -> dict:
+    """Read a text file from disk and return its content (text only, default UTF-8, max 200 KB)."""
+    args: dict[str, Any] = {"path": path}
+    if encoding:
+        args["encoding"] = encoding
+    if max_bytes is not None:
+        args["max_bytes"] = max_bytes
+    return _call("read_file", args)
+
+
+@mcp.tool()
+def file_info(path: str) -> dict:
+    """Get metadata about a file or folder: kind, size, extension and last modification time."""
+    return _call("file_info", {"path": path})
+
+
+@mcp.tool()
+def copy_file(src: str, dst: str) -> dict:
+    """Copy a file or folder on disk; creates destination folders, destination must not exist."""
+    return _call("copy_file", {"src": src, "dst": dst})
+
+
+@mcp.tool()
+def delete_file(path: str, recursive: bool = False) -> dict:
+    """Delete a file from disk (folders require recursive=true). This cannot be undone."""
+    return _call("delete_file", {"path": path, "recursive": recursive})
+
+
+@mcp.tool()
+def download_file(url: str, path: str) -> dict:
+    """Download a http(s) URL to a local file (max 100 MB); destination must not exist."""
+    return _call("download_file", {"url": url, "path": path})
 
 
 # ------------------------------------------------------------------ view & selection
@@ -356,6 +493,28 @@ def zoom_to_selection(layer: str) -> dict:
     return _call("zoom_to_selection", {"layer": layer})
 
 
+@mcp.tool()
+def select_by_location(
+    layer: str,
+    other: str,
+    predicate: str = "intersects",
+    method: str = "new",
+) -> dict:
+    """Select features of 'layer' by spatial relationship with 'other'. predicate: intersects, contains, disjoint, equals, touches, overlaps, within, crosses. method: new, add, within, remove."""
+    return _call("select_by_location", {
+        "layer": layer,
+        "other": other,
+        "predicate": predicate,
+        "method": method,
+    })
+
+
+@mcp.tool()
+def zoom_to_project() -> dict:
+    """Pan and zoom the map canvas so all layers of the project fit in view."""
+    return _call("zoom_to_project", {})
+
+
 # ------------------------------------------------------------------ processing
 
 @mcp.tool()
@@ -374,6 +533,81 @@ def get_algorithm_info(id: str) -> dict:
 def run_algorithm(id: str, params: dict) -> dict:
     """Run a Processing algorithm synchronously (blocks until finished, up to 15 min). Layer params accept layer ids or names."""
     return _call("run_algorithm", {"id": id, "params": params}, timeout=ALGORITHM_TIMEOUT)
+
+
+@mcp.tool()
+def buffer(
+    layer: str,
+    distance: float,
+    segments: int = 5,
+    dissolve: bool = False,
+    name: str | None = None,
+    group: str | None = None,
+) -> dict:
+    """Buffer vector features by a distance (in layer CRS units) and add the result as a new layer."""
+    args: dict[str, Any] = {"layer": layer, "distance": distance, "segments": segments, "dissolve": dissolve}
+    if name:
+        args["name"] = name
+    if group:
+        args["group"] = group
+    return _call("buffer", args, timeout=ALGORITHM_TIMEOUT)
+
+
+@mcp.tool()
+def reproject_layer(layer: str, crs: str, name: str | None = None, group: str | None = None) -> dict:
+    """Reproject a vector layer to another CRS (e.g. 'EPSG:3857') and add the result as a new layer."""
+    args: dict[str, Any] = {"layer": layer, "crs": crs}
+    if name:
+        args["name"] = name
+    if group:
+        args["group"] = group
+    return _call("reproject_layer", args, timeout=ALGORITHM_TIMEOUT)
+
+
+@mcp.tool()
+def clip(layer: str, overlay: str, name: str | None = None, group: str | None = None) -> dict:
+    """Cut a vector layer with a polygon overlay layer (keep only what falls inside) and add the result as a new layer."""
+    args: dict[str, Any] = {"layer": layer, "overlay": overlay}
+    if name:
+        args["name"] = name
+    if group:
+        args["group"] = group
+    return _call("clip", args, timeout=ALGORITHM_TIMEOUT)
+
+
+@mcp.tool()
+def intersection(layer: str, overlay: str, name: str | None = None, group: str | None = None) -> dict:
+    """Intersect two vector layers (parts of 'layer' overlapping 'overlay', attributes of both) and add the result as a new layer."""
+    args: dict[str, Any] = {"layer": layer, "overlay": overlay}
+    if name:
+        args["name"] = name
+    if group:
+        args["group"] = group
+    return _call("intersection", args, timeout=ALGORITHM_TIMEOUT)
+
+
+@mcp.tool()
+def dissolve(layer: str, field: str | None = None, name: str | None = None, group: str | None = None) -> dict:
+    """Merge features of a vector layer into one (optionally one result per value of a field) and add the result as a new layer."""
+    args: dict[str, Any] = {"layer": layer}
+    if field:
+        args["field"] = field
+    if name:
+        args["name"] = name
+    if group:
+        args["group"] = group
+    return _call("dissolve", args, timeout=ALGORITHM_TIMEOUT)
+
+
+@mcp.tool()
+def fix_geometries(layer: str, name: str | None = None, group: str | None = None) -> dict:
+    """Repair invalid geometries of a vector layer and add the result as a new layer."""
+    args: dict[str, Any] = {"layer": layer}
+    if name:
+        args["name"] = name
+    if group:
+        args["group"] = group
+    return _call("fix_geometries", args, timeout=ALGORITHM_TIMEOUT)
 
 
 # ------------------------------------------------------------------ rendering & layouts
@@ -399,6 +633,12 @@ def render_map(
 def list_layouts() -> list[dict]:
     """List print layouts (composer pages) in the project with page sizes in mm."""
     return _call("list_layouts", {})["layouts"]
+
+
+@mcp.tool()
+def create_layout(name: str, width_mm: int = 210, height_mm: int = 297) -> dict:
+    """Create a print layout with a page and a map item showing the current view; export it later with export_layout."""
+    return _call("create_layout", {"name": name, "width_mm": width_mm, "height_mm": height_mm})
 
 
 @mcp.tool()

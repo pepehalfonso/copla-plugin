@@ -43,7 +43,8 @@ async def main():
                 "diagnose", "list_qgis_tools", "get_project_info", "load_project",
                 "save_project", "set_project_crs", "list_layers", "get_layer_info",
                 "add_layer", "create_layer", "download_layer", "http_get",
-                "save_layer_as", "add_basemap", "remove_layer", "rename_layer",
+                "save_layer_as", "add_basemap", "remove_layer", "remove_group",
+                "rename_layer",
                 "set_layer_visibility", "zoom_to_layer", "get_features",
                 "select_features", "run_expression", "add_features",
                 "update_attributes", "delete_features", "set_renderer",
@@ -51,6 +52,14 @@ async def main():
                 "zoom_to_selection", "list_directory", "move_file",
                 "search_algorithms", "get_algorithm_info",
                 "run_algorithm", "render_map", "list_layouts", "export_layout",
+                "create_group", "rename_group", "move_layer",
+                "add_field", "remove_field", "rename_field", "calculate_field",
+                "unique_values", "select_by_location", "zoom_to_project",
+                "save_style", "load_style", "copy_style",
+                "read_file", "file_info", "copy_file", "delete_file",
+                "download_file", "http_post",
+                "buffer", "reproject_layer", "clip", "intersection",
+                "dissolve", "fix_geometries", "create_layout",
             }
             missing = expected - set(names)
             assert not missing, "missing tools: %s" % missing

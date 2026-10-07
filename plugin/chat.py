@@ -8,6 +8,7 @@ HTTP bridge does.
 """
 
 import json
+import re
 import os
 import traceback
 
@@ -71,7 +72,7 @@ def _readonly_tool_names():
 
 AGENTS = {
     "Copla": {
-        "description": "Asistente geoespacial completo: lee y modifica el proyecto (36 herramientas).",
+        "description": "Asistente geoespacial completo: lee y modifica el proyecto (63 herramientas).",
         "prompt": "",
         "tools": "all",
     },
@@ -103,6 +104,7 @@ AGENTS = {
             "set_renderer", "set_labels", "set_extent", "set_layer_visibility",
             "zoom_to_layer", "zoom_to_selection", "clear_selection", "add_basemap",
             "render_map", "list_layouts", "export_layout",
+            "save_style", "load_style", "copy_style", "create_layout", "zoom_to_project",
         },
     },
     "Editor": {
@@ -117,10 +119,13 @@ AGENTS = {
             "Respondé en el idioma del usuario, de forma concisa."
         ),
         "tools": _readonly_tool_names() | {
-            "add_layer", "create_layer", "remove_layer", "rename_layer",
+            "add_layer", "create_layer", "remove_layer", "remove_group", "rename_layer",
+            "create_group", "rename_group", "move_layer",
             "add_features", "delete_features", "update_attributes",
+            "add_field", "remove_field", "rename_field", "calculate_field",
             "run_algorithm", "save_layer_as", "save_project", "load_project",
             "set_project_crs",
+            "buffer", "reproject_layer", "clip", "intersection", "dissolve", "fix_geometries",
         },
     },
     "Descargas y archivos": {
@@ -135,6 +140,7 @@ AGENTS = {
         ),
         "tools": _readonly_tool_names() | {
             "download_layer", "move_file", "create_layer", "save_layer_as", "add_layer",
+            "copy_file", "download_file", "delete_file",
         },
     },
     "General": {
@@ -304,6 +310,7 @@ class ChatEngine(QObject):
         self._use_stream = True
         self._round_start = 0
         self._iteration = 0
+        self._retries429 = 0
         self._buf = ""
         self._content_parts = []
         self._tool_acc = {}
@@ -327,6 +334,7 @@ class ChatEngine(QObject):
         if not text:
             return
         self._round_start = len(self.messages)
+        self._retries429 = 0
         self.messages.append({"role": "user", "content": text})
         _save_history(self.messages)
         self._start_round(0)
@@ -483,7 +491,20 @@ class ChatEngine(QObject):
                 )
             else:
                 message = err_str or "sin conexión con el proveedor"
-            if status == 400 and self._streaming and self._use_stream:
+            if status == 429 and not stopped and self._retries429 < 3:
+                self._retries429 += 1
+                QTimer.singleShot(self._retry_delay_ms(message), self._retry_429)
+                return
+            transient = status is None or (
+                isinstance(status, int)
+                and (status == 400 or status >= 500)
+            )
+            if (
+                self._streaming
+                and self._use_stream
+                and not self._stopped
+                and transient
+            ):
                 self._use_stream = False
                 self._resume_without_stream()
                 return
@@ -526,6 +547,21 @@ class ChatEngine(QObject):
         self._buf = ""
         self._streaming = False
         self._post_chat(stream=False)
+
+    def _retry_delay_ms(self, message):
+        match = re.search(r"in (\d+(?:\.\d+)?)s", message or "")
+        if match:
+            seconds = float(match.group(1)) + 2.0
+        else:
+            seconds = 15.0
+        return int(max(5.0, min(60.0, seconds)) * 1000)
+
+    def _retry_429(self):
+        if self._stopped or not self._busy:
+            if self._stopped:
+                self._set_busy(False)
+            return
+        self._start_round(self._iteration)
 
     def _ingest_non_stream(self, body):
         try:
@@ -599,13 +635,13 @@ class ChatEngine(QObject):
                 text = "ERROR[tool_error]: %s" % exc
                 status = "error"
                 traceback.print_exc()
-            self.tool_event.emit(name, summary, status)
             self.messages.append({
                 "role": "tool",
                 "tool_call_id": assistant_msg["tool_calls"][i]["id"],
                 "name": name,
                 "content": text,
             })
+            self.tool_event.emit(name, summary, status)
         self._start_round(self._iteration + 1)
 
     def _fail(self, message):
