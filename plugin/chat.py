@@ -1,9 +1,11 @@
 """Embedded chat engine for Copla.
 
-Talks to any OpenAI-compatible chat completions endpoint (OpenCode Zen /
-MiMo Free, OpenRouter free, Groq, Gemini, Ollama, LM Studio, ...) with
-streaming and tool calling against the local typed tool registry. There is
-no arbitrary-code path: tools are resolved through tools.run_tool like the
+Ships its own providers inside the plugin - no API key, no signup, no
+registration anywhere: Pollinations in the cloud plus optional local
+Ollama / LM Studio, with automatic failover between them. Talks to any
+OpenAI-compatible chat completions endpoint with streaming and tool
+calling against the local typed tool registry. There is no
+arbitrary-code path: tools are resolved through tools.run_tool like the
 HTTP bridge does.
 """
 
@@ -18,52 +20,51 @@ from qgis.PyQt.QtNetwork import QNetworkReply, QNetworkRequest
 
 from .tools import TOOLS, ToolError, run_tool
 
+DEFAULT_BASE_URL = "https://text.pollinations.ai/openai"
+DEFAULT_MODEL = "openai"
+
 PRESETS = {
-    "Gratis (sin API key)": {
-        "base_url": "https://text.pollinations.ai/openai",
-        "model": "openai",
-        "hint": "Cero configuración: sin registro ni key, sale funcionando. "
-                "Servicio comunitario con límites de uso; si necesitás más, "
-                "cambiá de proveedor con este mismo menú.",
-    },
-    "MiMo v2.5 Free (Zen)": {
-        "base_url": "https://opencode.ai/zen/v1",
-        "model": "mimo-v2.5-free",
-        "hint": "Requiere tu propia API key de opencode.ai (el free tier de "
-                "Zen solo opera desde la app de opencode, no desde acá).",
-    },
-    "OpenRouter (free)": {
-        "base_url": "https://openrouter.ai/api/v1",
-        "model": "nvidia/nemotron-3-super-120b-a12b:free",
-        "hint": "Key gratis sin tarjeta: openrouter.ai/keys. Modelos ':free' "
-                "rotativos con tool calling (DeepSeek y GLM MIT aparecen cuando hay cupo).",
-    },
-    "Groq (free)": {
-        "base_url": "https://api.groq.com/openai/v1",
-        "model": "openai/gpt-oss-120b",
-        "hint": "Gratis sin tarjeta: console.groq.com/keys. Inferencia muy rápida.",
-    },
-    "Google Gemini (free)": {
-        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
-        "model": "gemini-2.5-flash",
-        "hint": "Gratis sin tarjeta: aistudio.google.com/apikey (tier gratuito ~250 req/día).",
+    "Pollinations (sin registro)": {
+        "base_url": DEFAULT_BASE_URL,
+        "model": DEFAULT_MODEL,
+        "hint": "Incluido en el plugin: funciona de entrada, sin registro, "
+                "sin API key y sin tarjeta (nube comunitaria con límites de uso).",
     },
     "Ollama (local)": {
         "base_url": "http://127.0.0.1:11434/v1",
         "model": "qwen2.5:7b",
-        "hint": "Sin key: instalá Ollama y ejecutá `ollama pull qwen2.5:7b`. 100% local.",
+        "hint": "Incluido: 100% local y sin registro. Requiere Ollama instalado "
+                "y corriendo (`ollama pull qwen2.5:7b`).",
     },
     "LM Studio (local)": {
         "base_url": "http://127.0.0.1:1234/v1",
         "model": "local-model",
-        "hint": "Sin key: abrí LM Studio y activá el servidor local.",
-    },
-    "Personalizado": {
-        "base_url": "",
-        "model": "",
-        "hint": "Cualquier endpoint compatible con OpenAI: URL base + API key + modelo.",
+        "hint": "Incluido: 100% local y sin registro. Requiere LM Studio con el "
+                "servidor local activado.",
     },
 }
+
+LEGACY_PROVIDER_URLS = {
+    "https://api.groq.com/openai/v1",
+    "https://openrouter.ai/api/v1",
+    "https://generativelanguage.googleapis.com/v1beta/openai",
+    "https://opencode.ai/zen/v1",
+}
+
+
+def _norm_base(url):
+    return (url or "").rstrip("/")
+
+
+def _bundled_after(current_base):
+    """Labels of bundled providers after `current_base`, rotating. Empty
+    for URLs outside the bundled set (no failover for custom endpoints)."""
+    labels = list(PRESETS)
+    index = {_norm_base(PRESETS[label]["base_url"]): i for i, label in enumerate(labels)}
+    start = index.get(_norm_base(current_base))
+    if start is None:
+        return []
+    return [labels[(start + i) % len(labels)] for i in range(1, len(labels))]
 
 
 def _readonly_tool_names():
@@ -187,9 +188,8 @@ def _history_path():
 
 def load_config():
     config = {
-        "base_url": "https://text.pollinations.ai/openai",
-        "api_key": "",
-        "model": "openai",
+        "base_url": DEFAULT_BASE_URL,
+        "model": DEFAULT_MODEL,
         "system_prompt": DEFAULT_SYSTEM_PROMPT,
         "agent": "Copla",
     }
@@ -200,6 +200,9 @@ def load_config():
             config.update({k: v for k, v in saved.items() if k in config})
     except (OSError, ValueError):
         pass
+    if _norm_base(config["base_url"]) in LEGACY_PROVIDER_URLS:
+        config["base_url"] = DEFAULT_BASE_URL
+        config["model"] = DEFAULT_MODEL
     if not config["system_prompt"]:
         config["system_prompt"] = DEFAULT_SYSTEM_PROMPT
     if config.get("agent") not in AGENTS:
@@ -295,6 +298,7 @@ class ChatEngine(QObject):
     tool_event = pyqtSignal(str, str, str)
     error_raised = pyqtSignal(str)
     busy_changed = pyqtSignal(bool)
+    notice = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -316,6 +320,9 @@ class ChatEngine(QObject):
         self._tool_acc = {}
         self._finish_reason = None
         self._streaming = True
+        self._tried_bases = set()
+        self._active_base = None
+        self._active_model = None
 
     # ------------------------------------------------------------- public
 
@@ -335,6 +342,9 @@ class ChatEngine(QObject):
             return
         self._round_start = len(self.messages)
         self._retries429 = 0
+        self._active_base = None
+        self._active_model = None
+        self._tried_bases = {_norm_base(self.config.get("base_url"))}
         self.messages.append({"role": "user", "content": text})
         _save_history(self.messages)
         self._start_round(0)
@@ -384,10 +394,10 @@ class ChatEngine(QObject):
         return payload
 
     def _post_chat(self, stream):
-        base = (self.config.get("base_url") or "").rstrip("/")
+        base = _norm_base(self._active_base or self.config.get("base_url"))
         url = base + "/chat/completions"
         body = {
-            "model": self.config.get("model"),
+            "model": self._active_model or self.config.get("model"),
             "messages": self._messages_payload(),
             "stream": stream,
             "temperature": 0.3,
@@ -397,9 +407,6 @@ class ChatEngine(QObject):
             body["tools"] = tools
         request = QNetworkRequest(QUrl(url))
         request.setHeader(QNetworkRequest.ContentTypeHeader, "application/json")
-        key = self.config.get("api_key") or ""
-        if key:
-            request.setRawHeader(b"Authorization", ("Bearer %s" % key).encode("utf-8"))
         data = QByteArray(json.dumps(body, ensure_ascii=False).encode("utf-8"))
         self._streaming = stream
         self._reply = self._nam.post(request, data)
@@ -508,7 +515,7 @@ class ChatEngine(QObject):
                 self._use_stream = False
                 self._resume_without_stream()
                 return
-            self._fail("El proveedor respondió error: %s" % message)
+            self._fail_or_failover(message)
             return
         if stopped:
             partial = "".join(self._content_parts)
@@ -567,7 +574,7 @@ class ChatEngine(QObject):
         try:
             data = json.loads(body)
         except ValueError:
-            self._fail("Respuesta no es JSON: %s" % body[:200])
+            self._fail_or_failover("Respuesta no es JSON: %s" % body[:200])
             return False
         for choice in data.get("choices") or []:
             message = choice.get("message") or {}
@@ -643,6 +650,34 @@ class ChatEngine(QObject):
             })
             self.tool_event.emit(name, summary, status)
         self._start_round(self._iteration + 1)
+
+    def _fail_or_failover(self, message):
+        chain = [
+            label
+            for label in _bundled_after(self._active_base or self.config.get("base_url"))
+            if _norm_base(PRESETS[label]["base_url"]) not in self._tried_bases
+        ]
+        if not chain:
+            self._fail("El proveedor respondió error: %s" % message)
+            return
+        current = self._active_base or self.config.get("base_url") or ""
+        current_label = next(
+            (
+                label
+                for label, preset in PRESETS.items()
+                if _norm_base(preset["base_url"]) == _norm_base(current)
+            ),
+            current,
+        )
+        label = chain[0]
+        self._tried_bases.add(_norm_base(PRESETS[label]["base_url"]))
+        self._active_base = PRESETS[label]["base_url"]
+        self._active_model = PRESETS[label]["model"]
+        self._retries429 = 0
+        self.notice.emit(
+            "%s no responde (%s) → probando %s…" % (current_label, message, label)
+        )
+        self._start_round(self._iteration)
 
     def _fail(self, message):
         self.messages = self.messages[: self._round_start]

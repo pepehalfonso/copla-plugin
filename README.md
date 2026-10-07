@@ -45,12 +45,14 @@ PyQGIS: capas, features, Processing, layouts, renders
   dentro del complemento; no existe endpoint de código arbitrario.
 - **Instalación en 1 clic**: el panel *Copla* dentro de QGIS genera el
   snippet de configuración exacto para tu cliente IA (copiar y pegar).
-- **Chat embebido**: pestaña *Chat* en el mismo panel — **sale
-  funcionando sin API key** (preset *Gratis*), con streaming,
-  tool-calling sobre las herramientas del complemento, burbujas de
-  conversación, chips de herramientas clickeables, mapa embebido en
-  la respuesta, selector de agentes e historial persistente, sin
-  cliente IA externo.
+- **Chat embebido**: pestaña *Chat* en el mismo panel — **los
+  proveedores vienen incluidos en el complemento** (Pollinations en la
+  nube y Ollama / LM Studio locales, opcionales): funciona sin API key,
+  sin registro ni cuenta en ningún lado, con failover automático entre
+  proveedores, streaming, tool-calling sobre las herramientas del
+  complemento, burbujas de conversación, chips de herramientas
+  clickeables, mapa embebido en la respuesta, selector de agentes e
+  historial persistente, sin cliente IA externo.
 - **Auto-descubrimiento**: el lado MCP encuentra QGIS solo, leyendo
   `copla.json` de tu perfil. No hay puertos ni tokens que configurar a mano.
 - **Seguro por defecto**: solo `127.0.0.1`, token aleatorio obligatorio,
@@ -205,14 +207,16 @@ Con QGIS abierto y el cliente conectado, probá algo como:
 El dock *Copla* tiene una pestaña **Chat** con un asistente integrado —
 no necesita un cliente IA externo:
 
-- **Cero configuración**: recién instalado ya funciona con el preset
-  **Gratis (sin API key)** (Pollinations.AI: sin registro, compatible
-  con OpenAI, con límites de uso comunitarios). Si querés otro
-  proveedor, hay presets listos: **OpenRouter (modelos free)**,
-  **Groq (free)**, **Google Gemini (free)**, **MiMo v2.5 Free**
-  (OpenCode Zen, con key propia de opencode.ai), Ollama y LM Studio
-  (locales, sin key) o un endpoint personalizado. Cambiar de proveedor
-  es elegirlo en el menú; cada preset explica dónde conseguir la key.
+- **Cero configuración, cero registro**: los proveedores vienen
+  **incluidos en el complemento** y no hace falta registrarse en ningún
+  servicio ni conseguir API keys. El predeterminado es
+  **Pollinations (sin registro)** (Pollinations.AI: compatible con
+  OpenAI, con límites de uso comunitarios) y, si querés correr todo en
+  tu máquina, están **Ollama (local)** y **LM Studio (local)** — sin
+  key, sin cuenta. Si el proveedor activo falla (401, límite de uso,
+  caída), el chat **cambia solo al siguiente proveedor incluido** y
+  avisa en la barra de estado. Cambiar de proveedor es elegirlo en el
+  menú.
 - **Selector de agentes al estilo opencode**: elegís con un clic entre
   *Copla* (herramientas completas), *Explorador* (solo lectura),
   *Cartógrafo* (simbología, etiquetas, mapas y layouts), *Editor*
@@ -233,14 +237,14 @@ no necesita un cliente IA externo:
 - Puede **descargar capas de internet**, gestionar archivos locales,
   editar datos y todo lo que hace una IA externa — porque usa las
   mismas herramientas.
-- La configuración (URL, clave, modelo, prompt) se guarda en tu perfil
+- La configuración (proveedor, modelo, prompt) se guarda en tu perfil
   (`copla_chat.json`) y la conversación en `copla_chat_history.json`;
-  la clave nunca sale de tu equipo.
+  no hay claves ni cuentas de ningún tipo.
 
 Uso: pestaña *Chat* → escribir y Enter — ya funciona sin configurar
-nada. Para cambiar de proveedor: el pill del proveedor (⚙), elegir el
-preset y pegar la key si lo pide. Por ejemplo: *“descargá los países
-de world.geo.json y pintalos por continente”*.
+nada. Para cambiar de proveedor: el pill del proveedor (⚙) y elegir uno
+de los incluidos (Pollinations, Ollama o LM Studio). Por ejemplo:
+*“descargá los países de world.geo.json y pintalos por continente”*.
 
 ## Herramientas (63, tipadas)
 

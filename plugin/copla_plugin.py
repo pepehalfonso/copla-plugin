@@ -381,6 +381,7 @@ class CoplaPlugin:
         self.chat.assistant_finished.connect(self._on_chat_finished)
         self.chat.error_raised.connect(self._on_chat_error)
         self.chat.busy_changed.connect(self._on_chat_busy)
+        self.chat.notice.connect(self._on_chat_notice)
 
         dock = QDockWidget("Copla", self.iface.mainWindow())
         dock.setObjectName("CoplaDock")
@@ -647,38 +648,26 @@ class CoplaPlugin:
         cfg.addWidget(self.cfg_model, 1, 1, 1, 3)
         cfg.addWidget(QLabel("URL base:"), 2, 0)
         self.cfg_url = QLineEdit()
-        self.cfg_url.setPlaceholderText("https://api.openai.com/v1")
+        self.cfg_url.setPlaceholderText("https://text.pollinations.ai/openai")
         cfg.addWidget(self.cfg_url, 2, 1, 1, 3)
-        cfg.addWidget(QLabel("API key:"), 3, 0)
-        self.cfg_key = QLineEdit()
-        self.cfg_key.setEchoMode(QLineEdit.Password)
-        cfg.addWidget(self.cfg_key, 3, 1)
-        show_key = QCheckBox("Mostrar")
-        show_key.toggled.connect(
-            lambda on: self.cfg_key.setEchoMode(
-                QLineEdit.Normal if on else QLineEdit.Password
-            )
-        )
-        cfg.addWidget(show_key, 3, 2)
         save_btn = QPushButton("Guardar")
         save_btn.clicked.connect(self._chat_save_config)
         cfg.addWidget(save_btn, 3, 3)
         self.cfg_hint = QLabel()
         self.cfg_hint.setWordWrap(True)
         self.cfg_hint.setStyleSheet("color:#5f6368; font-size:11px;")
-        cfg.addWidget(self.cfg_hint, 4, 1, 1, 3)
-        cfg.addWidget(QLabel("Prompt de sistema (agente Copla):"), 5, 0)
+        cfg.addWidget(self.cfg_hint, 3, 1, 1, 2)
+        cfg.addWidget(QLabel("Prompt de sistema (agente Copla):"), 4, 0)
         self.cfg_prompt = QTextEdit()
         self.cfg_prompt.setPlainText(
             self.chat.config.get("system_prompt") or DEFAULT_SYSTEM_PROMPT
         )
         self.cfg_prompt.setFixedHeight(70)
-        cfg.addWidget(self.cfg_prompt, 5, 1, 1, 3)
+        cfg.addWidget(self.cfg_prompt, 4, 1, 1, 3)
         outer.addWidget(self.cfg_group)
 
         self.cfg_url.setText(self.chat.config.get("base_url", ""))
         self.cfg_model.setText(self.chat.config.get("model", ""))
-        self.cfg_key.setText(self.chat.config.get("api_key", ""))
 
         self.chat_view = _ChatView()
         self.chat_view.setObjectName("chatView")
@@ -721,7 +710,7 @@ class CoplaPlugin:
         self.cfg_toggle = QPushButton("⚙")
         self.cfg_toggle.setObjectName("gearBtn")
         self.cfg_toggle.setCheckable(True)
-        self.cfg_toggle.setToolTip("Configuración del chat (proveedor, API key, prompt)")
+        self.cfg_toggle.setToolTip("Configuración del chat (proveedor, modelo, prompt)")
         self.cfg_toggle.toggled.connect(self._chat_toggle_cfg)
         foot.addWidget(self.cfg_toggle)
 
@@ -790,7 +779,7 @@ class CoplaPlugin:
         ):
             self.cfg_group.setVisible(True)
             self.cfg_toggle.setChecked(True)
-            self.cfg_key.setFocus()
+            self.cfg_url.setFocus()
             self.chat_status.setText("Configurá proveedor y modelo")
             return
         if not self.chat.messages:
@@ -841,7 +830,6 @@ class CoplaPlugin:
     def _apply_preset(self, label):
         preset = PRESETS.get(label)
         self.cfg_hint.setText(preset.get("hint", "") if preset else "")
-        self.cfg_key.setText(preset.get("api_key", "") if preset else "")
         if preset and preset.get("base_url"):
             self.cfg_url.setText(preset["base_url"])
             if preset.get("model"):
@@ -849,7 +837,6 @@ class CoplaPlugin:
 
     def _commit_preset(self, label):
         self.chat.config["base_url"] = self.cfg_url.text().strip()
-        self.chat.config["api_key"] = self.cfg_key.text().strip()
         self.chat.config["model"] = self.cfg_model.text().strip()
         save_config(self.chat.config)
         self.chat_status.setText("Proveedor: %s" % label)
@@ -883,7 +870,7 @@ class CoplaPlugin:
     def _chat_match_preset(self):
         self._cfg_loading = True
         try:
-            matched = "Personalizado"
+            matched = next(iter(PRESETS))
             url = (self.chat.config.get("base_url") or "").rstrip("/")
             model = self.chat.config.get("model") or ""
             for label, preset in PRESETS.items():
@@ -909,7 +896,6 @@ class CoplaPlugin:
         self.chat.config.update(
             {
                 "base_url": self.cfg_url.text().strip(),
-                "api_key": self.cfg_key.text().strip(),
                 "model": self.cfg_model.text().strip(),
                 "system_prompt": self.cfg_prompt.toPlainText().strip()
                 or DEFAULT_SYSTEM_PROMPT,
@@ -985,6 +971,11 @@ class CoplaPlugin:
         self._chat_append_plain(str(message))
         self._close_bubble()
         self.chat_status.setText("Error")
+
+    def _on_chat_notice(self, message):
+        self._chat_close_stream()
+        self._close_bubble()
+        self.chat_status.setText(str(message))
 
     def _on_chat_busy(self, busy):
         self.chat_send_btn.setEnabled(not busy)
